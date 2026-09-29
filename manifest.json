@@ -1,0 +1,15 @@
+{
+  "name": "Gestures",
+  "version": "0.1.0",
+  "author": "dcqwqc",
+  "homepage": "https://github.com/dcqwqc/caelestia-plugin-gestures",
+  "icon": "gesture",
+  "description": "Mirai touchpad and touchscreen gestures: Aseprite pinch zoom, 3-finger Undo, 4-finger Redo, and the existing four-finger Remote Desktop swipe.",
+  "entryPoints": [
+    {
+      "type": "quick-toggle",
+      "source": "toggles/GesturesToggle.qml",
+      "properties": { "name": "gestures" }
+    }
+  ]
+}
