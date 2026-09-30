@@ -482,20 +482,46 @@ class MTWatcher:
             self.two_start_distance = distance
             self.two_last_distance = distance
             self.pinch_total_log = 0.0
+            self.touch_geometry = touchscreen_logical_geometry()
+
             if self.kind == "touchscreen":
-                self.touch_geometry = touchscreen_logical_geometry()
+                # Direct touch should feel immediate. Start as canvas pan as
+                # soon as the second finger is established; a deliberate scale
+                # change can still promote this gesture to zoom below.
                 px, py = self.touch_to_cursor(round(cx), round(cy))
                 move_cursor(px, py)
-            else:
-                self.touch_geometry = touchscreen_logical_geometry()
+                if not self.pan_active:
+                    mouse_middle_down()
+                    self.pan_active = True
+                self.two_mode = "pan"
+                log("touchscreen two-finger -> PAN immediate")
             return
 
         sx, sy = self.two_start_centroid
         centroid_travel = math.hypot(ncx - sx, ncy - sy)
         total_scale_log = math.log(distance / self.two_start_distance)
 
-        # Decide once, then lock until all fingers lift. Translation and scale
-        # are both normalized, so this behaves the same on touchpad + screen.
+        # Direct touchscreen starts in PAN immediately, but a deliberate pinch
+        # should still win. Promote PAN -> ZOOM once scale change clearly
+        # dominates translation.
+        if self.kind == "touchscreen" and self.two_mode == "pan":
+            zoom_strength = abs(total_scale_log)
+            if (
+                zoom_strength >= TWO_ZOOM_START_LOG
+                and zoom_strength >= centroid_travel * TWO_ZOOM_DOMINANCE
+            ):
+                self.two_mode = "zoom"
+                self.pinch_active = True
+                self.release_pan()
+                self.pinch_accum = 0.0
+                self.two_last_distance = distance
+                log(
+                    f"touchscreen PAN -> ZOOM "
+                    f"scale={zoom_strength:.3f} translate={centroid_travel:.3f}"
+                )
+
+        # Touchpad still waits for classification, because native touchpad
+        # movement is much noisier and accidental pan should be avoided.
         if self.two_mode is None:
             zoom_strength = abs(total_scale_log)
             if (
