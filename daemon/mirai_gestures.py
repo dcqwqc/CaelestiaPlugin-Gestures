@@ -176,8 +176,11 @@ def aseprite_active() -> bool:
         value = False
         try:
             data = json.loads(hypr_request("j/activewindow", timeout=0.05) or "{}")
+            # Match the application identity, never the mutable window title.
+            # A browser tab such as "Aseprite pinch zoom setup" must not engage
+            # the bridge and disable normal touchscreen input.
             haystack = " ".join(
-                str(data.get(k, "")) for k in ("class", "initialClass", "title", "initialTitle")
+                str(data.get(k, "")) for k in ("class", "initialClass")
             ).lower()
             value = "aseprite" in haystack
             if not value:
