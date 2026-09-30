@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import socket
 import sys
 import threading
 import time
@@ -45,11 +46,11 @@ DRAG_ARM_SECONDS = 0.38
 DRAG_START_MOVE = 70.0
 REMOTE_SWIPE_DISTANCE = 500.0
 REMOTE_COOLDOWN = 0.85
-TWO_PAN_START = 0.012        # normalized centroid travel (~1.2% of pad/screen)
+TWO_PAN_START = 0.008        # normalized centroid travel (~0.8% of pad/screen)
 TWO_ZOOM_START_LOG = 0.040    # ~4% genuine scale change before zoom locks in
 TWO_ZOOM_DOMINANCE = 1.30    # scale change must beat centroid translation
-PINCH_TICKS_PER_LOG = 30.0    # about one wheel notch per ~3.3% scale change
-PINCH_TICK_LIMIT = 3          # avoid bursty jumps from one frame
+PINCH_TICKS_PER_LOG = 12.0    # gentler: one wheel notch per ~8.7% scale change
+PINCH_TICK_LIMIT = 1          # avoid bursty jumps from one frame
 
 
 def log(message: str) -> None:
@@ -75,6 +76,19 @@ def ydotool(*args: str) -> None:
         pass
 
 
+def ydotool_sync(*args: str) -> None:
+    env = os.environ.copy()
+    env.setdefault("YDOTOOL_SOCKET", f"/run/user/{os.getuid()}/.ydotool_socket")
+    try:
+        subprocess.run(
+            ["ydotool", *args], env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=0.20, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def mouse_click(button: str) -> None:
     code = {"left": "0xC0", "right": "0xC1"}[button]
     ydotool("click", code)
@@ -89,16 +103,43 @@ def mouse_left_up() -> None:
 
 
 def mouse_middle_down() -> None:
-    ydotool("click", "0x42")
+    # Blocking is intentional: Aseprite must see button-down before cursor motion.
+    ydotool_sync("click", "0x42")
 
 
 def mouse_middle_up() -> None:
-    ydotool("click", "0x82")
+    ydotool_sync("click", "0x82")
+
+
+def hypr_socket_path() -> str:
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    return f"/run/user/{os.getuid()}/hypr/{sig}/.socket.sock"
+
+
+def hypr_request(message: str, timeout: float = 0.08) -> str:
+    """Small direct Hyprland IPC request; avoids spawning hyprctl per frame."""
+    path = hypr_socket_path()
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(path)
+            sock.sendall(message.encode())
+            sock.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks).decode(errors="replace")
+    except OSError:
+        return ""
 
 
 def move_cursor(x: int, y: int) -> None:
-    expr = f'hl.dsp.cursor.move({{ x = {int(x)}, y = {int(y)} }})'
-    quiet_popen(["hyprctl", "dispatch", expr])
+    hypr_request(f'dispatch hl.dsp.cursor.move({{ x = {int(x)}, y = {int(y)} }})')
 
 
 def wheel(ticks: int) -> None:
@@ -130,16 +171,11 @@ def aseprite_active() -> bool:
     global _active_cache
     now = time.monotonic()
     with _active_lock:
-        if now - _active_cache[0] < 0.20:
+        if now - _active_cache[0] < 0.03:
             return _active_cache[1]
         value = False
         try:
-            p = subprocess.run(
-                ["hyprctl", "-j", "activewindow"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, timeout=0.20, check=False,
-            )
-            data = json.loads(p.stdout or "{}")
+            data = json.loads(hypr_request("j/activewindow", timeout=0.05) or "{}")
             haystack = " ".join(
                 str(data.get(k, "")) for k in ("class", "initialClass", "title", "initialTitle")
             ).lower()
@@ -155,7 +191,7 @@ def aseprite_active() -> bool:
                         except OSError:
                             pass
                     value = "aseprite" in " ".join(parts).lower()
-        except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        except (ValueError, json.JSONDecodeError):
             value = False
         _active_cache = (now, value)
         return value
@@ -224,18 +260,13 @@ def touch_policy_loop() -> None:
                     if want_bridge
                     else "input -> native Hyprland"
                 )
-        time.sleep(0.10)
+        time.sleep(0.03)
 
 
 def touchscreen_logical_geometry() -> tuple[int, int, int, int, int]:
     """Return x, y, logical width, logical height, transform for eDP-1."""
     try:
-        p = subprocess.run(
-            ["hyprctl", "-j", "monitors"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, timeout=0.25, check=False,
-        )
-        for mon in json.loads(p.stdout or "[]"):
+        for mon in json.loads(hypr_request("j/monitors", timeout=0.08) or "[]"):
             if mon.get("name") == TOUCHSCREEN_OUTPUT:
                 scale = float(mon.get("scale") or 1.0)
                 return (
@@ -245,7 +276,7 @@ def touchscreen_logical_geometry() -> tuple[int, int, int, int, int]:
                     max(1, round(float(mon.get("height") or 1) / scale)),
                     int(mon.get("transform") or 0),
                 )
-    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+    except (ValueError, json.JSONDecodeError):
         pass
     return (0, 0, 1440, 900, 0)
 
@@ -322,14 +353,9 @@ class MTWatcher:
     @staticmethod
     def current_cursor() -> tuple[int, int]:
         try:
-            p = subprocess.run(
-                ["hyprctl", "cursorpos"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, timeout=0.15, check=False,
-            )
-            x, y = p.stdout.strip().split(",", 1)
+            x, y = hypr_request("cursorpos", timeout=0.05).strip().split(",", 1)
             return int(float(x)), int(float(y.strip()))
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+        except ValueError:
             return (0, 0)
 
     def pan_delta_to_cursor(self, dx: float, dy: float) -> None:
@@ -399,6 +425,10 @@ class MTWatcher:
             self.touch_geometry = touchscreen_logical_geometry()
             cx, cy = self.touch_to_cursor(round(centroid[0]), round(centroid[1]))
             move_cursor(cx, cy)
+            mouse_middle_down()
+            self.pan_active = True
+            self.pan_last_emit = now
+            log("touchscreen one-finger -> Aseprite pan (immediate)")
 
     @staticmethod
     def centroid(positioned: list[dict[str, int | None]]) -> tuple[float, float] | None:
@@ -583,11 +613,7 @@ class MTWatcher:
 
             if self.kind == "touchscreen" and aseprite_active():
                 if len(active) == 1 and len(positioned) == 1:
-                    if move >= 35.0 and not self.pan_active:
-                        mouse_middle_down()
-                        self.pan_active = True
-                        log("touchscreen one-finger -> Aseprite pan")
-                    if self.pan_active and now - self.pan_last_emit >= 0.008:
+                    if self.pan_active and now - self.pan_last_emit >= 0.004:
                         px, py = self.touch_to_cursor(round(c[0]), round(c[1]))
                         move_cursor(px, py)
                         self.pan_last_emit = now

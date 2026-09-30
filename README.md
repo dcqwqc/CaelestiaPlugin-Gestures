@@ -36,3 +36,15 @@ two-finger pan cannot leak through as Aseprite wheel-zoom.
 
 The Wacom pen/stylus is a separate device and is never disabled. When focus
 leaves Aseprite, native Hyprland touchscreen handling is restored automatically.
+
+
+### Gesture feel / latency
+
+- Pinch zoom gain is intentionally reduced to about 40% of the original value
+  and is capped to one wheel notch per update.
+- Direct touchscreen panning grabs immediately on first contact instead of
+  waiting for a movement threshold.
+- High-frequency cursor movement and active-window checks use Hyprland's Unix
+  IPC socket directly instead of spawning hyprctl for every frame.
+- Middle-button press/release is synchronous so Aseprite always sees the grab
+  before the first cursor movement.
