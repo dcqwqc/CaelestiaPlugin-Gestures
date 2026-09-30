@@ -41,8 +41,8 @@ DRAG_ARM_SECONDS = 0.38
 DRAG_START_MOVE = 70.0
 REMOTE_SWIPE_DISTANCE = 500.0
 REMOTE_COOLDOWN = 0.85
-PINCH_START_LOG = 0.025       # ~2.5% scale change before zoom engages
-PINCH_TICKS_PER_LOG = 14.0    # smooth but deliberate Aseprite zoom
+PINCH_START_LOG = 0.018       # ~1.8% scale change before zoom engages
+PINCH_TICKS_PER_LOG = 30.0    # about one wheel notch per ~3.3% scale change
 PINCH_TICK_LIMIT = 3          # avoid bursty jumps from one frame
 
 
@@ -235,6 +235,9 @@ class MTWatcher:
             self.pinch_active = True
             log(f"{self.kind} pinch -> Aseprite zoom engaged")
             self.pinch_accum = self.pinch_total_log * PINCH_TICKS_PER_LOG
+            # An intentional short pinch must still visibly do something.
+            if abs(self.pinch_accum) < 1.0:
+                self.pinch_accum = math.copysign(1.0, self.pinch_total_log)
         else:
             if not aseprite_active():
                 self.pinch_active = False
