@@ -331,33 +331,45 @@ def set_touchscreen_enabled(enabled: bool) -> bool:
 def touch_policy_loop() -> None:
     global _touch_disabled_for_aseprite
     native_scroll = configured_touchpad_scroll_factor()
+    last_enforce = 0.0
     while True:
         want_bridge = aseprite_active()
-        with _touch_policy_lock:
-            if want_bridge != _touch_disabled_for_aseprite:
-                # Direct touchscreen is fully owned by the daemon in Aseprite.
+        now = time.monotonic()
+        transition = want_bridge != _touch_disabled_for_aseprite
+
+        # Hyprland can occasionally return "ok" for a live device mutation
+        # while the touch device is still settling/reappearing. Re-assert the
+        # intended state periodically so a single flaky transition can never
+        # leave the touchscreen permanently disabled.
+        periodic_reassert = now - last_enforce >= 0.75
+
+        if transition or periodic_reassert:
+            with _touch_policy_lock:
                 touch_ok = set_touchscreen_enabled(not want_bridge)
+                scroll_ok = set_touchpad_scroll_factor(
+                    0.0 if want_bridge else native_scroll
+                )
+                last_enforce = now
 
-                # Native two-finger touchpad scrolling looks like mouse-wheel
-                # input to Aseprite and therefore zooms. Zero it only in
-                # Aseprite; raw MT data still reaches this daemon, which cleanly
-                # separates translation (pan) from scale change (zoom).
-                scroll_ok = set_touchpad_scroll_factor(0.0 if want_bridge else native_scroll)
-
-                # Only advance policy state when the critical touchscreen
-                # mutation succeeded. Otherwise retry instead of claiming the
-                # Aseprite bridge is active when raw touch still leaks through.
                 if touch_ok:
+                    changed = transition
                     _touch_disabled_for_aseprite = want_bridge
-                    log(
-                        (
-                            "Aseprite bridge -> touchscreen raw + touchpad raw 2-finger"
-                            if want_bridge
-                            else "input -> native Hyprland"
+                    if changed:
+                        log(
+                            (
+                                "Aseprite bridge -> touchscreen raw + touchpad raw 2-finger"
+                                if want_bridge
+                                else "input -> native Hyprland"
+                            )
+                            + (
+                                " (touchpad scroll updated)"
+                                if scroll_ok
+                                else " (touchpad scroll update FAILED)"
+                            )
                         )
-                        + (" (touchpad scroll updated)" if scroll_ok else " (touchpad scroll update FAILED)")
-                    )
-        time.sleep(0.03)
+                else:
+                    log("touchscreen policy reassert failed; retrying")
+        time.sleep(0.05)
 
 
 def touchscreen_logical_geometry() -> tuple[int, int, int, int, int]:
@@ -968,6 +980,12 @@ def control(action: str) -> int:
 
 
 def daemon() -> None:
+    # Always recover native touch first. If a previous process died while
+    # Aseprite owned the raw touchscreen, Hyprland may still have the physical
+    # device disabled.
+    set_touchscreen_enabled(True)
+    set_touchpad_scroll_factor(configured_touchpad_scroll_factor())
+
     ensure_touch_mouse()
     time.sleep(0.08)
     hypr_eval(
