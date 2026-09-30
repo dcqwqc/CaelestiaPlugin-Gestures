@@ -213,43 +213,40 @@ def configured_touchpad_scroll_factor() -> float:
     return 0.3
 
 
-def hypr_keyword(option: str, value: str) -> bool:
-    """Set one runtime Hyprland option and make failures visible in the journal."""
+def hypr_eval(expr: str, label: str) -> bool:
+    """Apply one live Lua config mutation and make failures visible."""
     try:
         p = subprocess.run(
-            ["hyprctl", "keyword", option, value],
+            ["hyprctl", "eval", expr],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, timeout=0.50, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
-        log(f"hypr keyword failed {option}={value}: {e}")
+        log(f"hypr eval failed {label}: {e}")
         return False
 
     output = (p.stdout or "").strip()
-    if p.returncode != 0 or (output and output.lower() != "ok"):
-        log(
-            f"hypr keyword failed {option}={value}: "
-            f"rc={p.returncode} output={output!r}"
-        )
+    if p.returncode != 0 or output.lower() != "ok":
+        log(f"hypr eval failed {label}: rc={p.returncode} output={output!r}")
         return False
     return True
 
 
 def set_touchpad_scroll_factor(value: float) -> bool:
-    # Hyprland 0.55+ runtime per-device syntax is device[name]:option.
-    return hypr_keyword(
-        f"device[{TOUCHPAD_HYPR_NAME}]:scroll_factor",
-        f"{value:g}",
+    expr = (
+        'hl.device({ name = "' + TOUCHPAD_HYPR_NAME +
+        '", scroll_factor = ' + f"{value:g}" + ' })'
     )
+    return hypr_eval(expr, f"touchpad scroll_factor={value:g}")
 
 
 def set_touchscreen_enabled(enabled: bool) -> bool:
-    # hl.device() describes config; keyword device[name]:enabled is the
-    # supported live per-device mutation path.
-    return hypr_keyword(
-        f"device[{TOUCHSCREEN_HYPR_NAME}]:enabled",
-        "true" if enabled else "false",
+    value = "true" if enabled else "false"
+    expr = (
+        'hl.device({ name = "' + TOUCHSCREEN_HYPR_NAME +
+        '", enabled = ' + value + ' })'
     )
+    return hypr_eval(expr, f"touchscreen enabled={value}")
 
 
 def touch_policy_loop() -> None:
