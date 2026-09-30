@@ -213,29 +213,43 @@ def configured_touchpad_scroll_factor() -> float:
     return 0.3
 
 
-def set_touchpad_scroll_factor(value: float) -> None:
-    expr = f'hl.device({{ name = "{TOUCHPAD_HYPR_NAME}", scroll_factor = {value} }})'
+def hypr_keyword(option: str, value: str) -> bool:
+    """Set one runtime Hyprland option and make failures visible in the journal."""
     try:
-        subprocess.run(
-            ["hyprctl", "repl", expr],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=0.35, check=False,
+        p = subprocess.run(
+            ["hyprctl", "keyword", option, value],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=0.50, check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"hypr keyword failed {option}={value}: {e}")
+        return False
+
+    output = (p.stdout or "").strip()
+    if p.returncode != 0 or (output and output.lower() != "ok"):
+        log(
+            f"hypr keyword failed {option}={value}: "
+            f"rc={p.returncode} output={output!r}"
+        )
+        return False
+    return True
 
 
-def set_touchscreen_enabled(enabled: bool) -> None:
-    value = "true" if enabled else "false"
-    expr = f'hl.device({{ name = "{TOUCHSCREEN_HYPR_NAME}", enabled = {value} }})'
-    try:
-        subprocess.run(
-            ["hyprctl", "repl", expr],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=0.35, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+def set_touchpad_scroll_factor(value: float) -> bool:
+    # Hyprland 0.55+ runtime per-device syntax is device[name]:option.
+    return hypr_keyword(
+        f"device[{TOUCHPAD_HYPR_NAME}]:scroll_factor",
+        f"{value:g}",
+    )
+
+
+def set_touchscreen_enabled(enabled: bool) -> bool:
+    # hl.device() describes config; keyword device[name]:enabled is the
+    # supported live per-device mutation path.
+    return hypr_keyword(
+        f"device[{TOUCHSCREEN_HYPR_NAME}]:enabled",
+        "true" if enabled else "false",
+    )
 
 
 def touch_policy_loop() -> None:
@@ -246,20 +260,27 @@ def touch_policy_loop() -> None:
         with _touch_policy_lock:
             if want_bridge != _touch_disabled_for_aseprite:
                 # Direct touchscreen is fully owned by the daemon in Aseprite.
-                set_touchscreen_enabled(not want_bridge)
+                touch_ok = set_touchscreen_enabled(not want_bridge)
 
                 # Native two-finger touchpad scrolling looks like mouse-wheel
                 # input to Aseprite and therefore zooms. Zero it only in
                 # Aseprite; raw MT data still reaches this daemon, which cleanly
                 # separates translation (pan) from scale change (zoom).
-                set_touchpad_scroll_factor(0.0 if want_bridge else native_scroll)
+                scroll_ok = set_touchpad_scroll_factor(0.0 if want_bridge else native_scroll)
 
-                _touch_disabled_for_aseprite = want_bridge
-                log(
-                    "Aseprite bridge -> touchscreen raw + touchpad raw 2-finger"
-                    if want_bridge
-                    else "input -> native Hyprland"
-                )
+                # Only advance policy state when the critical touchscreen
+                # mutation succeeded. Otherwise retry instead of claiming the
+                # Aseprite bridge is active when raw touch still leaks through.
+                if touch_ok:
+                    _touch_disabled_for_aseprite = want_bridge
+                    log(
+                        (
+                            "Aseprite bridge -> touchscreen raw + touchpad raw 2-finger"
+                            if want_bridge
+                            else "input -> native Hyprland"
+                        )
+                        + (" (touchpad scroll updated)" if scroll_ok else " (touchpad scroll update FAILED)")
+                    )
         time.sleep(0.03)
 
 
