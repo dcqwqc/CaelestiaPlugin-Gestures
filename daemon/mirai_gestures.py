@@ -466,16 +466,14 @@ class MTWatcher:
             return (0, 0)
 
     def pan_button_down(self) -> None:
-        if self.kind == "touchscreen":
-            touch_mouse_middle_down()
-        else:
-            mouse_middle_down()
+        # Use the exact same middle-button transport for touchpad and
+        # touchscreen. Aseprite/XWayland reliably switches to its hand cursor
+        # for this path. Touchscreen motion itself remains on the low-latency
+        # persistent uinput mouse.
+        mouse_middle_down()
 
     def pan_button_up(self) -> None:
-        if self.kind == "touchscreen":
-            touch_mouse_middle_up()
-        else:
-            mouse_middle_up()
+        mouse_middle_up()
 
     def pan_delta_to_cursor(self, dx: float, dy: float) -> None:
         _, _, width, height, _ = self.touch_geometry
