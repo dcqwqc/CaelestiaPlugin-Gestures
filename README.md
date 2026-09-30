@@ -22,10 +22,17 @@ finger gesture layer available on Windows/macOS. While Aseprite is focused the
 service temporarily disables only Hyprland's `wacom-hid-53b7-finger` device and
 reads that kernel event stream directly:
 
-- one finger drag -> middle-button canvas pan
-- two-finger pinch -> wheel zoom
+- one finger drag on the touchscreen -> canvas pan
+- two fingers moving together -> canvas pan, horizontally and vertically
+- genuine two-finger pinch/spread -> zoom
 - three-finger tap -> Ctrl+Z
 - four-finger tap -> Ctrl+Y
+
+The two-finger recognizer is geometry-based and shared by touchpad + touchscreen.
+It compares normalized centroid translation with normalized finger-separation
+change, then locks the gesture to PAN or ZOOM until lift-off. Native touchpad
+scrolling is temporarily set to zero only while Aseprite is focused so a
+two-finger pan cannot leak through as Aseprite wheel-zoom.
 
 The Wacom pen/stylus is a separate device and is never disabled. When focus
 leaves Aseprite, native Hyprland touchscreen handling is restored automatically.

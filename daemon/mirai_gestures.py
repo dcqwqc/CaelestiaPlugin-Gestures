@@ -33,6 +33,7 @@ ABS_MT_POSITION_Y = 0x36
 ABS_MT_TRACKING_ID = 0x39
 
 TOUCHPAD_NAME = "touchpad"
+TOUCHPAD_HYPR_NAME = "elan06fa:00-04f3:327e-touchpad"
 TOUCHSCREEN_NAME = "wacom hid 53b7 finger"
 TOUCHSCREEN_HYPR_NAME = "wacom-hid-53b7-finger"
 TOUCHSCREEN_OUTPUT = "eDP-1"
@@ -44,7 +45,9 @@ DRAG_ARM_SECONDS = 0.38
 DRAG_START_MOVE = 70.0
 REMOTE_SWIPE_DISTANCE = 500.0
 REMOTE_COOLDOWN = 0.85
-PINCH_START_LOG = 0.018       # ~1.8% scale change before zoom engages
+TWO_PAN_START = 0.012        # normalized centroid travel (~1.2% of pad/screen)
+TWO_ZOOM_START_LOG = 0.040    # ~4% genuine scale change before zoom locks in
+TWO_ZOOM_DOMINANCE = 1.30    # scale change must beat centroid translation
 PINCH_TICKS_PER_LOG = 30.0    # about one wheel notch per ~3.3% scale change
 PINCH_TICK_LIMIT = 3          # avoid bursty jumps from one frame
 
@@ -162,6 +165,30 @@ _touch_policy_lock = threading.Lock()
 _touch_disabled_for_aseprite = False
 
 
+def configured_touchpad_scroll_factor() -> float:
+    path = Path.home() / ".config/hypr/variables.lua"
+    try:
+        import re
+        match = re.search(r"touchpadScrollFactor\s*=\s*([0-9.]+)", path.read_text())
+        if match:
+            return float(match.group(1))
+    except (OSError, ValueError):
+        pass
+    return 0.3
+
+
+def set_touchpad_scroll_factor(value: float) -> None:
+    expr = f'hl.device({{ name = "{TOUCHPAD_HYPR_NAME}", scroll_factor = {value} }})'
+    try:
+        subprocess.run(
+            ["hyprctl", "repl", expr],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=0.35, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def set_touchscreen_enabled(enabled: bool) -> None:
     value = "true" if enabled else "false"
     expr = f'hl.device({{ name = "{TOUCHSCREEN_HYPR_NAME}", enabled = {value} }})'
@@ -177,16 +204,25 @@ def set_touchscreen_enabled(enabled: bool) -> None:
 
 def touch_policy_loop() -> None:
     global _touch_disabled_for_aseprite
+    native_scroll = configured_touchpad_scroll_factor()
     while True:
-        want_disabled = aseprite_active()
+        want_bridge = aseprite_active()
         with _touch_policy_lock:
-            if want_disabled != _touch_disabled_for_aseprite:
-                set_touchscreen_enabled(not want_disabled)
-                _touch_disabled_for_aseprite = want_disabled
+            if want_bridge != _touch_disabled_for_aseprite:
+                # Direct touchscreen is fully owned by the daemon in Aseprite.
+                set_touchscreen_enabled(not want_bridge)
+
+                # Native two-finger touchpad scrolling looks like mouse-wheel
+                # input to Aseprite and therefore zooms. Zero it only in
+                # Aseprite; raw MT data still reaches this daemon, which cleanly
+                # separates translation (pan) from scale change (zoom).
+                set_touchpad_scroll_factor(0.0 if want_bridge else native_scroll)
+
+                _touch_disabled_for_aseprite = want_bridge
                 log(
-                    "touchscreen -> raw Aseprite bridge"
-                    if want_disabled
-                    else "touchscreen -> native Hyprland"
+                    "Aseprite bridge -> touchscreen raw + touchpad raw 2-finger"
+                    if want_bridge
+                    else "input -> native Hyprland"
                 )
         time.sleep(0.10)
 
@@ -251,6 +287,14 @@ class MTWatcher:
         self.pinch_total_log = 0.0
         self.pinch_active = False
         self.pinch_accum = 0.0
+
+        # Two-finger gesture classifier. "pan" and "zoom" are mutually
+        # exclusive for the lifetime of one contact sequence.
+        self.two_mode: str | None = None
+        self.two_start_centroid: tuple[float, float] | None = None
+        self.two_last_centroid: tuple[float, float] | None = None
+        self.two_start_distance: float | None = None
+        self.two_last_distance: float | None = None
         self.remote_fired = False
         self.last_remote = 0.0
         self.last_single_tap = -999.0
@@ -268,6 +312,33 @@ class MTWatcher:
 
     def state_for(self, idx: int) -> dict[str, int | None]:
         return self.slots.setdefault(idx, {"id": None, "x": None, "y": None})
+
+    def norm_point(self, x: float, y: float) -> tuple[float, float]:
+        return (
+            (x - self.abs_x_min) / max(1, self.abs_x_max - self.abs_x_min),
+            (y - self.abs_y_min) / max(1, self.abs_y_max - self.abs_y_min),
+        )
+
+    @staticmethod
+    def current_cursor() -> tuple[int, int]:
+        try:
+            p = subprocess.run(
+                ["hyprctl", "cursorpos"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=0.15, check=False,
+            )
+            x, y = p.stdout.strip().split(",", 1)
+            return int(float(x)), int(float(y.strip()))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return (0, 0)
+
+    def pan_delta_to_cursor(self, dx: float, dy: float) -> None:
+        # Convert raw-device centroid movement to logical screen pixels.
+        _, _, width, height, _ = self.touch_geometry
+        px = dx / max(1, self.abs_x_max - self.abs_x_min) * width
+        py = dy / max(1, self.abs_y_max - self.abs_y_min) * height
+        cx, cy = self.current_cursor()
+        move_cursor(round(cx + px), round(cy + py))
 
     def touch_to_cursor(self, x: int, y: int) -> tuple[int, int]:
         nx = (x - self.abs_x_min) / max(1, self.abs_x_max - self.abs_x_min)
@@ -293,7 +364,7 @@ class MTWatcher:
         if self.pan_active:
             mouse_middle_up()
             self.pan_active = False
-            log("touchscreen pan -> end")
+            log(f"{self.kind} pan -> end")
 
     def reset_session(self) -> None:
         self.session = False
@@ -305,6 +376,11 @@ class MTWatcher:
         self.pinch_total_log = 0.0
         self.pinch_active = False
         self.pinch_accum = 0.0
+        self.two_mode = None
+        self.two_start_centroid = None
+        self.two_last_centroid = None
+        self.two_start_distance = None
+        self.two_last_distance = None
         self.remote_fired = False
         self.drag_candidate = False
         self.dragging = False
@@ -333,51 +409,96 @@ class MTWatcher:
             sum(int(s["y"]) for s in positioned) / len(positioned),
         )
 
-    def handle_pinch(self, positioned: list[dict[str, int | None]]) -> None:
-        if len(positioned) != 2:
-            self.pinch_last_distance = None
+    def handle_two_finger(self, positioned: list[dict[str, int | None]]) -> None:
+        if len(positioned) != 2 or not aseprite_active():
             return
+
         a, b = positioned
-        if self.kind == "touchscreen" and aseprite_active():
-            cx = (int(a["x"]) + int(b["x"])) // 2
-            cy = (int(a["y"]) + int(b["y"])) // 2
-            px, py = self.touch_to_cursor(cx, cy)
-            move_cursor(px, py)
+        ax, ay = float(a["x"]), float(a["y"])
+        bx, by = float(b["x"]), float(b["y"])
+        cx, cy = (ax + bx) / 2.0, (ay + by) / 2.0
 
-        distance = math.hypot(int(a["x"]) - int(b["x"]), int(a["y"]) - int(b["y"]))
-        if distance < 1.0:
+        nax, nay = self.norm_point(ax, ay)
+        nbx, nby = self.norm_point(bx, by)
+        ncx, ncy = (nax + nbx) / 2.0, (nay + nby) / 2.0
+        distance = math.hypot(nax - nbx, nay - nby)
+        if distance <= 1e-6:
             return
-        if self.pinch_last_distance is None:
-            self.pinch_last_distance = distance
+
+        if self.two_start_centroid is None or self.two_start_distance is None:
+            self.two_start_centroid = (ncx, ncy)
+            self.two_last_centroid = (cx, cy)
+            self.two_start_distance = distance
+            self.two_last_distance = distance
+            self.pinch_total_log = 0.0
+            if self.kind == "touchscreen":
+                self.touch_geometry = touchscreen_logical_geometry()
+                px, py = self.touch_to_cursor(round(cx), round(cy))
+                move_cursor(px, py)
+            else:
+                self.touch_geometry = touchscreen_logical_geometry()
             return
-        delta = math.log(distance / self.pinch_last_distance)
-        self.pinch_last_distance = distance
-        # Tiny width changes happen during ordinary two-finger scroll. Require a
-        # real cumulative scale change before converting anything to wheel.
-        self.pinch_total_log += delta
-        if not self.pinch_active:
-            if abs(self.pinch_total_log) < PINCH_START_LOG:
-                return
-            if not aseprite_active():
-                return
-            self.pinch_active = True
-            log(f"{self.kind} pinch -> Aseprite zoom engaged")
-            self.pinch_accum = self.pinch_total_log * PINCH_TICKS_PER_LOG
-            # An intentional short pinch must still visibly do something.
-            if abs(self.pinch_accum) < 1.0:
-                self.pinch_accum = math.copysign(1.0, self.pinch_total_log)
-        else:
-            if not aseprite_active():
-                self.pinch_active = False
+
+        sx, sy = self.two_start_centroid
+        centroid_travel = math.hypot(ncx - sx, ncy - sy)
+        total_scale_log = math.log(distance / self.two_start_distance)
+
+        # Decide once, then lock until all fingers lift. Translation and scale
+        # are both normalized, so this behaves the same on touchpad + screen.
+        if self.two_mode is None:
+            zoom_strength = abs(total_scale_log)
+            if (
+                zoom_strength >= TWO_ZOOM_START_LOG
+                and zoom_strength >= centroid_travel * TWO_ZOOM_DOMINANCE
+            ):
+                self.two_mode = "zoom"
+                self.pinch_active = True
+                self.release_pan()
                 self.pinch_accum = 0.0
-                return
-            self.pinch_accum += delta * PINCH_TICKS_PER_LOG
+                log(
+                    f"{self.kind} two-finger -> ZOOM "
+                    f"scale={zoom_strength:.3f} translate={centroid_travel:.3f}"
+                )
+            elif (
+                centroid_travel >= TWO_PAN_START
+                and centroid_travel >= zoom_strength / TWO_ZOOM_DOMINANCE
+            ):
+                self.two_mode = "pan"
+                self.pinch_active = False
+                if not self.pan_active:
+                    mouse_middle_down()
+                    self.pan_active = True
+                log(
+                    f"{self.kind} two-finger -> PAN "
+                    f"translate={centroid_travel:.3f} scale={zoom_strength:.3f}"
+                )
 
-        ticks = int(self.pinch_accum)
-        if ticks:
-            ticks = max(-PINCH_TICK_LIMIT, min(PINCH_TICK_LIMIT, ticks))
-            self.pinch_accum -= ticks
-            wheel(ticks)
+        if self.two_mode == "zoom":
+            if self.two_last_distance and self.two_last_distance > 1e-6:
+                delta = math.log(distance / self.two_last_distance)
+                self.pinch_accum += delta * PINCH_TICKS_PER_LOG
+                ticks = int(self.pinch_accum)
+                if ticks:
+                    ticks = max(-PINCH_TICK_LIMIT, min(PINCH_TICK_LIMIT, ticks))
+                    self.pinch_accum -= ticks
+                    if self.kind == "touchscreen":
+                        px, py = self.touch_to_cursor(round(cx), round(cy))
+                        move_cursor(px, py)
+                    wheel(ticks)
+
+        elif self.two_mode == "pan":
+            if self.two_last_centroid is not None:
+                last_cx, last_cy = self.two_last_centroid
+                dx, dy = cx - last_cx, cy - last_cy
+                if self.kind == "touchscreen":
+                    px, py = self.touch_to_cursor(round(cx), round(cy))
+                    move_cursor(px, py)
+                else:
+                    self.pan_delta_to_cursor(dx, dy)
+
+        self.two_last_centroid = (cx, cy)
+        self.two_last_distance = distance
+
 
     def finish(self, now: float) -> None:
         duration = now - self.started
@@ -446,6 +567,15 @@ class MTWatcher:
                 self.max_move = 0.0
             if self.max_fingers > 1:
                 self.drag_candidate = False
+            if self.max_fingers == 2:
+                self.release_pan()
+                self.two_mode = None
+                self.two_start_centroid = None
+                self.two_last_centroid = None
+                self.two_start_distance = None
+                self.two_last_distance = None
+                self.pinch_active = False
+                self.pinch_accum = 0.0
 
         if c is not None and self.start_centroid is not None and len(active) == self.max_fingers:
             move = math.hypot(c[0] - self.start_centroid[0], c[1] - self.start_centroid[1])
@@ -479,7 +609,7 @@ class MTWatcher:
         # It is Aseprite-only, so normal browser/image pinch behavior elsewhere
         # remains owned by the application/compositor.
         if len(active) == 2 and len(positioned) == 2:
-            self.handle_pinch(positioned)
+            self.handle_two_finger(positioned)
         elif len(active) != 2:
             self.pinch_last_distance = None
 
@@ -488,16 +618,15 @@ class MTWatcher:
         self.slots.clear()
         self.reset_session()
         with open(device, "rb", buffering=0) as f:
-            if self.kind == "touchscreen":
-                try:
-                    self.abs_x_min, self.abs_x_max = read_abs_range(f.fileno(), ABS_MT_POSITION_X)
-                    self.abs_y_min, self.abs_y_max = read_abs_range(f.fileno(), ABS_MT_POSITION_Y)
-                    log(
-                        f"touchscreen abs x={self.abs_x_min}..{self.abs_x_max} "
-                        f"y={self.abs_y_min}..{self.abs_y_max}"
-                    )
-                except OSError as e:
-                    log(f"touchscreen abs range read failed: {e}")
+            try:
+                self.abs_x_min, self.abs_x_max = read_abs_range(f.fileno(), ABS_MT_POSITION_X)
+                self.abs_y_min, self.abs_y_max = read_abs_range(f.fileno(), ABS_MT_POSITION_Y)
+                log(
+                    f"{self.kind} abs x={self.abs_x_min}..{self.abs_x_max} "
+                    f"y={self.abs_y_min}..{self.abs_y_max}"
+                )
+            except OSError as e:
+                log(f"{self.kind} abs range read failed: {e}")
             while True:
                 data = f.read(EVENT.size)
                 if len(data) != EVENT.size:
@@ -565,6 +694,7 @@ def daemon() -> None:
             time.sleep(5)
     finally:
         set_touchscreen_enabled(True)
+        set_touchpad_scroll_factor(configured_touchpad_scroll_factor())
 
 
 def main() -> int:
