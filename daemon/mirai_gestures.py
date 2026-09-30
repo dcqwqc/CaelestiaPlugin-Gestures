@@ -35,8 +35,8 @@ TOUCHPAD_NAME = "touchpad"
 TOUCHSCREEN_NAME = "wacom hid 53b7 finger"
 REMOTE = str(Path.home() / ".local/bin/kagami-remote")
 
-TAP_MAX_SECONDS = 0.32
-TAP_MAX_MOVE = 95.0
+TAP_MAX_SECONDS = 0.50
+TAP_MAX_MOVE = 180.0
 DRAG_ARM_SECONDS = 0.38
 DRAG_START_MOVE = 70.0
 REMOTE_SWIPE_DISTANCE = 500.0
@@ -44,6 +44,10 @@ REMOTE_COOLDOWN = 0.85
 PINCH_START_LOG = 0.025       # ~2.5% scale change before zoom engages
 PINCH_TICKS_PER_LOG = 14.0    # smooth but deliberate Aseprite zoom
 PINCH_TICK_LIMIT = 3          # avoid bursty jumps from one frame
+
+
+def log(message: str) -> None:
+    print(f"[mirai-gestures] {time.monotonic():.3f} {message}", flush=True)
 
 
 def quiet_popen(argv: list[str]) -> None:
@@ -81,14 +85,17 @@ def mouse_left_up() -> None:
 def wheel(ticks: int) -> None:
     if not ticks:
         return
-    # REL_WHEEL: positive is wheel-up. Aseprite maps wheel-up to zoom in.
-    ydotool("mousemove", "--wheel", "-y", str(ticks))
+    # ydotool wheel mode takes positional x/y deltas after "--".
+    ydotool("mousemove", "--wheel", "--", "0", str(ticks))
+    log(f"wheel ticks={ticks}")
 
 
 def hypr_shortcut(key: str) -> None:
-    # Hyprland >= 0.55 uses Lua dispatchers. No shell interpolation here.
-    expr = f'hl.dispatch(hl.dsp.send_shortcut({{mods="CTRL", key="{key}"}}))'
-    quiet_popen(["hyprctl", "eval", expr])
+    # External dispatcher path is reliable on Hyprland 0.56 for both native
+    # Wayland and XWayland clients.
+    expr = f'hl.dsp.send_shortcut({{ mods = "CTRL", key = "{key}" }})'
+    quiet_popen(["hyprctl", "dispatch", expr])
+    log(f"shortcut ctrl+{key}")
 
 
 def toggle_remote() -> None:
@@ -106,14 +113,30 @@ def aseprite_active() -> bool:
     with _active_lock:
         if now - _active_cache[0] < 0.20:
             return _active_cache[1]
+        value = False
         try:
             p = subprocess.run(
-                ["hyprctl", "repl", 'local w=hl.get_active_window(); if w then print(w.class or ""); print(w.title or "") end'],
+                ["hyprctl", "-j", "activewindow"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, timeout=0.20, check=False,
             )
-            value = "aseprite" in p.stdout.lower()
-        except (OSError, subprocess.TimeoutExpired):
+            data = json.loads(p.stdout or "{}")
+            haystack = " ".join(
+                str(data.get(k, "")) for k in ("class", "initialClass", "title", "initialTitle")
+            ).lower()
+            value = "aseprite" in haystack
+            if not value:
+                pid = int(data.get("pid") or 0)
+                if pid > 0:
+                    parts = []
+                    for f in (Path(f"/proc/{pid}/comm"), Path(f"/proc/{pid}/cmdline")):
+                        try:
+                            raw = f.read_bytes().replace(bytes([0]), b" ")
+                            parts.append(raw.decode(errors="replace"))
+                        except OSError:
+                            pass
+                    value = "aseprite" in " ".join(parts).lower()
+        except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
             value = False
         _active_cache = (now, value)
         return value
@@ -210,6 +233,7 @@ class MTWatcher:
             if not aseprite_active():
                 return
             self.pinch_active = True
+            log(f"{self.kind} pinch -> Aseprite zoom engaged")
             self.pinch_accum = self.pinch_total_log * PINCH_TICKS_PER_LOG
         else:
             if not aseprite_active():
@@ -233,25 +257,30 @@ class MTWatcher:
             return
 
         is_tap = (
-            self.kind == "touchpad"
-            and duration <= TAP_MAX_SECONDS
+            duration <= TAP_MAX_SECONDS
             and self.max_move <= TAP_MAX_MOVE
             and not self.pinch_active
             and not self.remote_fired
         )
         fingers = self.max_fingers
+        if fingers >= 3 and not is_tap:
+            log(f"{self.kind} {fingers}-finger end rejected: duration={duration:.3f}s move={self.max_move:.1f} pinch={self.pinch_active} remote={self.remote_fired}")
         if is_tap:
-            if fingers == 1:
+            if self.kind == "touchpad" and fingers == 1:
                 mouse_click("left")
+                log("touchpad tap1 -> left click")
                 self.last_single_tap = now
-            elif fingers == 2:
+            elif self.kind == "touchpad" and fingers == 2:
                 mouse_click("right")
+                log("touchpad tap2 -> right click")
                 self.last_single_tap = -999.0
             elif fingers == 3:
                 hypr_shortcut("z")
+                log(f"{self.kind} tap3 -> undo")
                 self.last_single_tap = -999.0
             elif fingers == 4:
                 hypr_shortcut("y")
+                log(f"{self.kind} tap4 -> redo")
                 self.last_single_tap = -999.0
         self.reset_session()
 
@@ -268,9 +297,21 @@ class MTWatcher:
         c = self.centroid(positioned) if len(positioned) == len(active) else None
         if not self.session:
             self.begin(active, c)
-        self.max_fingers = max(self.max_fingers, len(active))
 
-        if c is not None and self.start_centroid is not None:
+        # A multi-finger tap arrives one contact at a time. Measuring movement
+        # from finger #1's centroid makes the centroid jump merely because
+        # fingers #2/#3/#4 were placed, falsely rejecting every multi-finger
+        # tap as movement. Rebase when the peak finger count increases, and
+        # freeze movement once contacts start lifting.
+        if len(active) > self.max_fingers:
+            self.max_fingers = len(active)
+            if c is not None:
+                self.start_centroid = c
+                self.max_move = 0.0
+            if self.max_fingers > 1:
+                self.drag_candidate = False
+
+        if c is not None and self.start_centroid is not None and len(active) == self.max_fingers:
             move = math.hypot(c[0] - self.start_centroid[0], c[1] - self.start_centroid[1])
             self.max_move = max(self.max_move, move)
 
@@ -283,6 +324,7 @@ class MTWatcher:
                     self.remote_fired = True
                     self.last_remote = now
                     toggle_remote()
+                    log("touchpad swipe4 -> remote toggle")
 
         # Pinch zoom is supported on both the touchpad and direct touchscreen.
         # It is Aseprite-only, so normal browser/image pinch behavior elsewhere
