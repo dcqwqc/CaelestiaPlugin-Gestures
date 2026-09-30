@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import fcntl
 import math
 import os
 from pathlib import Path
@@ -33,6 +34,8 @@ ABS_MT_TRACKING_ID = 0x39
 
 TOUCHPAD_NAME = "touchpad"
 TOUCHSCREEN_NAME = "wacom hid 53b7 finger"
+TOUCHSCREEN_HYPR_NAME = "wacom-hid-53b7-finger"
+TOUCHSCREEN_OUTPUT = "eDP-1"
 REMOTE = str(Path.home() / ".local/bin/kagami-remote")
 
 TAP_MAX_SECONDS = 0.50
@@ -80,6 +83,19 @@ def mouse_left_down() -> None:
 
 def mouse_left_up() -> None:
     ydotool("click", "0x80")
+
+
+def mouse_middle_down() -> None:
+    ydotool("click", "0x42")
+
+
+def mouse_middle_up() -> None:
+    ydotool("click", "0x82")
+
+
+def move_cursor(x: int, y: int) -> None:
+    expr = f'hl.dsp.cursor.move({{ x = {int(x)}, y = {int(y)} }})'
+    quiet_popen(["hyprctl", "dispatch", expr])
 
 
 def wheel(ticks: int) -> None:
@@ -142,6 +158,71 @@ def aseprite_active() -> bool:
         return value
 
 
+_touch_policy_lock = threading.Lock()
+_touch_disabled_for_aseprite = False
+
+
+def set_touchscreen_enabled(enabled: bool) -> None:
+    value = "true" if enabled else "false"
+    expr = f'hl.device({{ name = "{TOUCHSCREEN_HYPR_NAME}", enabled = {value} }})'
+    try:
+        subprocess.run(
+            ["hyprctl", "repl", expr],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=0.35, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def touch_policy_loop() -> None:
+    global _touch_disabled_for_aseprite
+    while True:
+        want_disabled = aseprite_active()
+        with _touch_policy_lock:
+            if want_disabled != _touch_disabled_for_aseprite:
+                set_touchscreen_enabled(not want_disabled)
+                _touch_disabled_for_aseprite = want_disabled
+                log(
+                    "touchscreen -> raw Aseprite bridge"
+                    if want_disabled
+                    else "touchscreen -> native Hyprland"
+                )
+        time.sleep(0.10)
+
+
+def touchscreen_logical_geometry() -> tuple[int, int, int, int, int]:
+    """Return x, y, logical width, logical height, transform for eDP-1."""
+    try:
+        p = subprocess.run(
+            ["hyprctl", "-j", "monitors"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=0.25, check=False,
+        )
+        for mon in json.loads(p.stdout or "[]"):
+            if mon.get("name") == TOUCHSCREEN_OUTPUT:
+                scale = float(mon.get("scale") or 1.0)
+                return (
+                    int(mon.get("x") or 0),
+                    int(mon.get("y") or 0),
+                    max(1, round(float(mon.get("width") or 1) / scale)),
+                    max(1, round(float(mon.get("height") or 1) / scale)),
+                    int(mon.get("transform") or 0),
+                )
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        pass
+    return (0, 0, 1440, 900, 0)
+
+
+def read_abs_range(fd: int, code: int) -> tuple[int, int]:
+    # EVIOCGABS(code), struct input_absinfo = six signed ints.
+    cmd = (2 << 30) | (24 << 16) | (ord("E") << 8) | (0x40 + code)
+    data = bytearray(24)
+    fcntl.ioctl(fd, cmd, data, True)
+    _value, minimum, maximum, _fuzz, _flat, _resolution = struct.unpack("iiiiii", data)
+    return minimum, maximum
+
+
 def find_device(name_fragment: str) -> str | None:
     for dev in sorted(glob.glob("/dev/input/event*")):
         event = os.path.basename(dev)
@@ -176,8 +257,43 @@ class MTWatcher:
         self.drag_candidate = False
         self.dragging = False
 
+        # Direct touchscreen -> Aseprite bridge state.
+        self.abs_x_min = 0
+        self.abs_x_max = 1
+        self.abs_y_min = 0
+        self.abs_y_max = 1
+        self.pan_active = False
+        self.pan_last_emit = 0.0
+        self.touch_geometry = (0, 0, 1440, 900, 0)
+
     def state_for(self, idx: int) -> dict[str, int | None]:
         return self.slots.setdefault(idx, {"id": None, "x": None, "y": None})
+
+    def touch_to_cursor(self, x: int, y: int) -> tuple[int, int]:
+        nx = (x - self.abs_x_min) / max(1, self.abs_x_max - self.abs_x_min)
+        ny = (y - self.abs_y_min) / max(1, self.abs_y_max - self.abs_y_min)
+        nx = max(0.0, min(1.0, nx))
+        ny = max(0.0, min(1.0, ny))
+        ox, oy, width, height, transform = self.touch_geometry
+
+        # wl_output transforms 0/1/2/3 are normal/90/180/270.
+        if transform == 1:
+            nx, ny = 1.0 - ny, nx
+        elif transform == 2:
+            nx, ny = 1.0 - nx, 1.0 - ny
+        elif transform == 3:
+            nx, ny = ny, 1.0 - nx
+
+        return (
+            ox + round(nx * max(1, width - 1)),
+            oy + round(ny * max(1, height - 1)),
+        )
+
+    def release_pan(self) -> None:
+        if self.pan_active:
+            mouse_middle_up()
+            self.pan_active = False
+            log("touchscreen pan -> end")
 
     def reset_session(self) -> None:
         self.session = False
@@ -192,6 +308,8 @@ class MTWatcher:
         self.remote_fired = False
         self.drag_candidate = False
         self.dragging = False
+        self.pan_active = False
+        self.pan_last_emit = 0.0
 
     def begin(self, active: list[dict[str, int | None]], centroid: tuple[float, float] | None) -> None:
         now = time.monotonic()
@@ -201,6 +319,10 @@ class MTWatcher:
         self.start_centroid = centroid
         self.max_move = 0.0
         self.drag_candidate = self.kind == "touchpad" and len(active) == 1 and now - self.last_single_tap <= DRAG_ARM_SECONDS
+        if self.kind == "touchscreen" and len(active) == 1 and centroid is not None and aseprite_active():
+            self.touch_geometry = touchscreen_logical_geometry()
+            cx, cy = self.touch_to_cursor(round(centroid[0]), round(centroid[1]))
+            move_cursor(cx, cy)
 
     @staticmethod
     def centroid(positioned: list[dict[str, int | None]]) -> tuple[float, float] | None:
@@ -216,6 +338,12 @@ class MTWatcher:
             self.pinch_last_distance = None
             return
         a, b = positioned
+        if self.kind == "touchscreen" and aseprite_active():
+            cx = (int(a["x"]) + int(b["x"])) // 2
+            cy = (int(a["y"]) + int(b["y"])) // 2
+            px, py = self.touch_to_cursor(cx, cy)
+            move_cursor(px, py)
+
         distance = math.hypot(int(a["x"]) - int(b["x"]), int(a["y"]) - int(b["y"]))
         if distance < 1.0:
             return
@@ -253,6 +381,11 @@ class MTWatcher:
 
     def finish(self, now: float) -> None:
         duration = now - self.started
+        if self.pan_active:
+            self.release_pan()
+            self.last_single_tap = -999.0
+            self.reset_session()
+            return
         if self.dragging:
             mouse_left_up()
             self.last_single_tap = -999.0
@@ -318,6 +451,19 @@ class MTWatcher:
             move = math.hypot(c[0] - self.start_centroid[0], c[1] - self.start_centroid[1])
             self.max_move = max(self.max_move, move)
 
+            if self.kind == "touchscreen" and aseprite_active():
+                if len(active) == 1 and len(positioned) == 1:
+                    if move >= 35.0 and not self.pan_active:
+                        mouse_middle_down()
+                        self.pan_active = True
+                        log("touchscreen one-finger -> Aseprite pan")
+                    if self.pan_active and now - self.pan_last_emit >= 0.008:
+                        px, py = self.touch_to_cursor(round(c[0]), round(c[1]))
+                        move_cursor(px, py)
+                        self.pan_last_emit = now
+                elif self.pan_active:
+                    self.release_pan()
+
             if self.kind == "touchpad" and self.drag_candidate and self.max_fingers == 1 and not self.dragging and move >= DRAG_START_MOVE:
                 mouse_left_down()
                 self.dragging = True
@@ -342,6 +488,16 @@ class MTWatcher:
         self.slots.clear()
         self.reset_session()
         with open(device, "rb", buffering=0) as f:
+            if self.kind == "touchscreen":
+                try:
+                    self.abs_x_min, self.abs_x_max = read_abs_range(f.fileno(), ABS_MT_POSITION_X)
+                    self.abs_y_min, self.abs_y_max = read_abs_range(f.fileno(), ABS_MT_POSITION_Y)
+                    log(
+                        f"touchscreen abs x={self.abs_x_min}..{self.abs_x_max} "
+                        f"y={self.abs_y_min}..{self.abs_y_max}"
+                    )
+                except OSError as e:
+                    log(f"touchscreen abs range read failed: {e}")
             while True:
                 data = f.read(EVENT.size)
                 if len(data) != EVENT.size:
@@ -374,6 +530,7 @@ class MTWatcher:
             except (OSError, PermissionError):
                 if self.dragging:
                     mouse_left_up()
+                self.release_pan()
                 time.sleep(1)
 
 
@@ -394,13 +551,20 @@ def control(action: str) -> int:
 def daemon() -> None:
     workers = [MTWatcher("touchpad"), MTWatcher("touchscreen")]
     threads = [threading.Thread(target=w.run_forever, daemon=True, name=f"mirai-{w.kind}") for w in workers]
+    policy = threading.Thread(target=touch_policy_loop, daemon=True, name="mirai-touch-policy")
     for t in threads:
         t.start()
-    while True:
-        for t in threads:
-            if not t.is_alive():
-                raise RuntimeError(f"gesture worker {t.name} stopped")
-        time.sleep(5)
+    policy.start()
+    try:
+        while True:
+            for t in threads:
+                if not t.is_alive():
+                    raise RuntimeError(f"gesture worker {t.name} stopped")
+            if not policy.is_alive():
+                raise RuntimeError("gesture policy worker stopped")
+            time.sleep(5)
+    finally:
+        set_touchscreen_enabled(True)
 
 
 def main() -> int:
