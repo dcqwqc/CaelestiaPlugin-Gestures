@@ -50,10 +50,12 @@ REMOTE_COOLDOWN = 0.85
 TWO_PAN_START = 0.008        # normalized centroid travel (~0.8% of pad/screen)
 TWO_ZOOM_START_LOG = 0.040    # touchpad: ~4% scale change before zoom locks in
 TWO_ZOOM_DOMINANCE = 1.30    # touchpad scale change vs centroid translation
-TOUCH_ZOOM_START_LOG = 0.075  # early pinch evidence (~7.8% scale change)
-TOUCH_ZOOM_DOMINANCE = 2.20   # pinch must strongly dominate translation
-TOUCH_ZOOM_CONFIRM_FRAMES = 3
-TOUCH_PAN_COMMIT = 0.012      # ~1.2% screen translation permanently locks PAN
+TOUCH_SETTLE_SECONDS = 0.12   # let second contact geometry stabilize first
+TOUCH_PAN_COMMIT = 0.006       # ~0.6% translation = intentional canvas move
+TOUCH_ZOOM_START_LOG = 0.120   # ~12.7% post-settle spacing change
+TOUCH_ZOOM_DOMINANCE = 2.50    # pinch must strongly dominate translation
+TOUCH_ZOOM_CONFIRM_FRAMES = 4
+TOUCH_DECISION_SECONDS = 0.45  # unresolved gesture defaults to PAN
 PINCH_TICKS_PER_LOG = 12.0    # gentler: one wheel notch per ~8.7% scale change
 PINCH_TICK_LIMIT = 1          # avoid bursty jumps from one frame
 
@@ -409,6 +411,8 @@ class MTWatcher:
         self.two_last_distance: float | None = None
         self.two_zoom_candidate_frames = 0
         self.two_pan_committed = False
+        self.two_started_at = 0.0
+        self.two_settled = False
         self.remote_fired = False
         self.last_remote = 0.0
         self.last_single_tap = -999.0
@@ -518,6 +522,8 @@ class MTWatcher:
         self.two_last_distance = None
         self.two_zoom_candidate_frames = 0
         self.two_pan_committed = False
+        self.two_started_at = 0.0
+        self.two_settled = False
         self.remote_fired = False
         self.drag_candidate = False
         self.dragging = False
@@ -574,6 +580,8 @@ class MTWatcher:
             self.two_start_distance = distance
             self.two_last_distance = distance
             self.pinch_total_log = 0.0
+            self.two_started_at = time.monotonic()
+            self.two_settled = self.kind != "touchscreen"
             self.touch_geometry = touchscreen_logical_geometry()
 
             if self.kind == "touchscreen":
@@ -594,32 +602,52 @@ class MTWatcher:
         centroid_travel = math.hypot(ncx - sx, ncy - sy)
         total_scale_log = math.log(distance / self.two_start_distance)
 
-        # Touchscreen intent is decided only at the start of the gesture.
-        # Once the centroid has translated enough to mean "move canvas", PAN
-        # is committed for the rest of this contact sequence. This prevents
-        # finger-spacing drift during a long pan from suddenly cancelling the
-        # middle-button grab and turning into zoom.
+        # Direct-touch contacts jump slightly while the second fingertip is
+        # settling. Ignore that geometry for a short window, then rebase once.
+        # After rebasing, the first clear intent wins and NEVER changes mode
+        # until all contacts lift.
         if self.kind == "touchscreen" and self.two_mode == "pan":
+            now = time.monotonic()
+            age = now - self.two_started_at
+
+            if not self.two_settled:
+                if age < TOUCH_SETTLE_SECONDS:
+                    self.two_last_centroid = (cx, cy)
+                    self.two_last_distance = distance
+                    return
+                self.two_settled = True
+                self.two_start_centroid = (ncx, ncy)
+                self.two_start_distance = distance
+                self.two_last_centroid = (cx, cy)
+                self.two_last_distance = distance
+                self.two_zoom_candidate_frames = 0
+                log("touchscreen two-finger geometry settled")
+                return
+
+            sx, sy = self.two_start_centroid
+            centroid_travel = math.hypot(ncx - sx, ncy - sy)
+            total_scale_log = math.log(distance / self.two_start_distance)
             zoom_strength = abs(total_scale_log)
 
-            if centroid_travel >= TOUCH_PAN_COMMIT:
-                if not self.two_pan_committed:
-                    log(
-                        f"touchscreen PAN committed "
-                        f"translate={centroid_travel:.3f} scale={zoom_strength:.3f}"
-                    )
+            # Translation has priority. A real two-finger drag should lock PAN
+            # before ordinary spacing jitter gets any opportunity to look like
+            # a pinch.
+            if not self.two_pan_committed and centroid_travel >= TOUCH_PAN_COMMIT:
                 self.two_pan_committed = True
                 self.two_zoom_candidate_frames = 0
+                log(
+                    f"touchscreen PAN locked "
+                    f"translate={centroid_travel:.3f} scale={zoom_strength:.3f}"
+                )
 
             if not self.two_pan_committed:
                 looks_like_pinch = (
                     zoom_strength >= TOUCH_ZOOM_START_LOG
                     and zoom_strength >= centroid_travel * TOUCH_ZOOM_DOMINANCE
                 )
-                if looks_like_pinch:
-                    self.two_zoom_candidate_frames += 1
-                else:
-                    self.two_zoom_candidate_frames = 0
+                self.two_zoom_candidate_frames = (
+                    self.two_zoom_candidate_frames + 1 if looks_like_pinch else 0
+                )
 
                 if self.two_zoom_candidate_frames >= TOUCH_ZOOM_CONFIRM_FRAMES:
                     self.two_mode = "zoom"
@@ -628,10 +656,13 @@ class MTWatcher:
                     self.pinch_accum = 0.0
                     self.two_last_distance = distance
                     log(
-                        f"touchscreen PAN -> ZOOM confirmed "
-                        f"scale={zoom_strength:.3f} translate={centroid_travel:.3f} "
-                        f"frames={self.two_zoom_candidate_frames}"
+                        f"touchscreen ZOOM locked "
+                        f"scale={zoom_strength:.3f} translate={centroid_travel:.3f}"
                     )
+                elif age >= TOUCH_DECISION_SECONDS:
+                    self.two_pan_committed = True
+                    self.two_zoom_candidate_frames = 0
+                    log("touchscreen PAN locked by decision timeout")
 
         # Touchpad still waits for classification, because native touchpad
         # movement is much noisier and accidental pan should be avoided.
@@ -681,7 +712,8 @@ class MTWatcher:
                 last_cx, last_cy = self.two_last_centroid
                 dx, dy = cx - last_cx, cy - last_cy
                 if self.kind == "touchscreen":
-                    self.pan_delta_to_uinput(dx, dy)
+                    if self.two_settled and self.two_pan_committed:
+                        self.pan_delta_to_uinput(dx, dy)
                 else:
                     self.pan_delta_to_cursor(dx, dy)
 
@@ -768,6 +800,8 @@ class MTWatcher:
                 self.two_last_distance = None
                 self.two_zoom_candidate_frames = 0
                 self.two_pan_committed = False
+                self.two_started_at = 0.0
+                self.two_settled = False
                 self.pinch_active = False
                 self.pinch_accum = 0.0
 
@@ -783,11 +817,12 @@ class MTWatcher:
                             self.pan_delta_to_uinput(c[0] - last_x, c[1] - last_y)
                         self.pan_last_centroid = c
                         self.pan_last_emit = now
-                elif self.pan_active and self.two_mode != "pan":
-                    # Only release the immediate one-finger grab while a
-                    # second contact is still being classified. Once the
-                    # two-finger recognizer locks to PAN, keep middle held
-                    # across all subsequent touch frames until lift-off.
+                elif self.pan_active and (
+                    len(active) >= 3 or self.two_mode == "zoom"
+                ):
+                    # Keep BTN_MIDDLE held continuously across the 1 -> 2
+                    # finger transition. Only a confirmed zoom or 3+ contacts
+                    # may release the canvas-pan grab.
                     self.release_pan()
 
             if self.kind == "touchpad" and self.drag_candidate and self.max_fingers == 1 and not self.dragging and move >= DRAG_START_MOVE:
