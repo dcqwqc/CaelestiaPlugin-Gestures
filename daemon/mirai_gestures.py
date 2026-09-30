@@ -56,6 +56,7 @@ TOUCH_ZOOM_START_LOG = 0.120   # ~12.7% post-settle spacing change
 TOUCH_ZOOM_DOMINANCE = 2.50    # pinch must strongly dominate translation
 TOUCH_ZOOM_CONFIRM_FRAMES = 4
 TOUCH_DECISION_SECONDS = 0.45  # unresolved gesture defaults to PAN
+TOUCH_DRAW_DELAY = 0.065         # allow a second finger to join without painting a dot
 PINCH_TICKS_PER_LOG = 12.0    # gentler: one wheel notch per ~8.7% scale change
 PINCH_TICK_LIMIT = 1          # avoid bursty jumps from one frame
 
@@ -166,6 +167,19 @@ def touch_mouse_middle_down() -> None:
 
 def touch_mouse_middle_up() -> None:
     touch_mouse_command("U")
+
+
+def touch_mouse_left_down() -> None:
+    touch_mouse_command("L")
+
+
+def touch_mouse_left_up() -> None:
+    touch_mouse_command("R")
+
+
+def touch_mouse_left_click() -> None:
+    touch_mouse_command("L")
+    touch_mouse_command("R")
 
 
 def touch_mouse_move(dx: int, dy: int) -> None:
@@ -427,6 +441,11 @@ class MTWatcher:
         self.pan_active = False
         self.pan_last_emit = 0.0
         self.pan_last_centroid: tuple[float, float] | None = None
+        self.draw_pending = False
+        self.draw_pending_since = 0.0
+        self.draw_active = False
+        self.draw_last_emit = 0.0
+        self.draw_last_centroid: tuple[float, float] | None = None
         self.touch_geometry = (0, 0, 1440, 900, 0)
 
     def state_for(self, idx: int) -> dict[str, int | None]:
@@ -499,6 +518,13 @@ class MTWatcher:
             oy + round(ny * max(1, height - 1)),
         )
 
+    def release_draw(self) -> None:
+        if self.draw_active:
+            touch_mouse_left_up()
+            self.draw_active = False
+            log("touchscreen draw -> end")
+        self.draw_pending = False
+
     def release_pan(self) -> None:
         if self.pan_active:
             self.pan_button_up()
@@ -530,6 +556,11 @@ class MTWatcher:
         self.pan_active = False
         self.pan_last_emit = 0.0
         self.pan_last_centroid = None
+        self.draw_pending = False
+        self.draw_pending_since = 0.0
+        self.draw_active = False
+        self.draw_last_emit = 0.0
+        self.draw_last_centroid = None
 
     def begin(self, active: list[dict[str, int | None]], centroid: tuple[float, float] | None) -> None:
         now = time.monotonic()
@@ -543,11 +574,11 @@ class MTWatcher:
             self.touch_geometry = touchscreen_logical_geometry()
             cx, cy = self.touch_to_cursor(round(centroid[0]), round(centroid[1]))
             move_cursor(cx, cy)
-            self.pan_button_down()
-            self.pan_active = True
-            self.pan_last_emit = now
-            self.pan_last_centroid = centroid
-            log("touchscreen one-finger -> Aseprite pan (immediate)")
+            self.draw_pending = True
+            self.draw_pending_since = now
+            self.draw_last_emit = now
+            self.draw_last_centroid = centroid
+            log("touchscreen one-finger -> brush cursor (draw pending)")
 
     @staticmethod
     def centroid(positioned: list[dict[str, int | None]]) -> tuple[float, float] | None:
@@ -723,6 +754,20 @@ class MTWatcher:
 
     def finish(self, now: float) -> None:
         duration = now - self.started
+        if self.kind == "touchscreen" and self.draw_active:
+            self.release_draw()
+            self.last_single_tap = -999.0
+            self.reset_session()
+            return
+        if self.kind == "touchscreen" and self.draw_pending and self.max_fingers == 1:
+            # A very quick touch (< draw delay) should still behave like a
+            # normal mouse click / pencil dot.
+            touch_mouse_left_click()
+            log("touchscreen one-finger -> click")
+            self.draw_pending = False
+            self.last_single_tap = -999.0
+            self.reset_session()
+            return
         if self.pan_active:
             self.release_pan()
             self.last_single_tap = -999.0
@@ -789,9 +834,11 @@ class MTWatcher:
             if self.max_fingers > 1:
                 self.drag_candidate = False
             if self.max_fingers == 2:
-                # Keep the touchscreen middle-button grab held while a second
-                # finger joins. This makes 1->2 finger panning continuous.
-                if self.kind != "touchscreen":
+                if self.kind == "touchscreen":
+                    # Finger #1 is a normal left-mouse draw. As soon as finger
+                    # #2 joins, cancel/release it before pan/zoom takes over.
+                    self.release_draw()
+                else:
                     self.release_pan()
                 self.two_mode = None
                 self.two_start_centroid = None
@@ -811,12 +858,25 @@ class MTWatcher:
 
             if self.kind == "touchscreen" and aseprite_active():
                 if len(active) == 1 and len(positioned) == 1:
-                    if self.pan_active and now - self.pan_last_emit >= 0.004:
-                        if self.pan_last_centroid is not None:
-                            last_x, last_y = self.pan_last_centroid
+                    # While pending, follow the finger like a mouse cursor but
+                    # don't paint yet; this avoids dots when a multi-touch
+                    # gesture begins one contact at a time.
+                    if self.draw_pending and not self.draw_active:
+                        px, py = self.touch_to_cursor(round(c[0]), round(c[1]))
+                        move_cursor(px, py)
+                        self.draw_last_centroid = c
+                        if now - self.draw_pending_since >= TOUCH_DRAW_DELAY:
+                            touch_mouse_left_down()
+                            self.draw_active = True
+                            self.draw_pending = False
+                            self.draw_last_emit = now
+                            log("touchscreen one-finger -> DRAW")
+                    elif self.draw_active and now - self.draw_last_emit >= 0.004:
+                        if self.draw_last_centroid is not None:
+                            last_x, last_y = self.draw_last_centroid
                             self.pan_delta_to_uinput(c[0] - last_x, c[1] - last_y)
-                        self.pan_last_centroid = c
-                        self.pan_last_emit = now
+                        self.draw_last_centroid = c
+                        self.draw_last_emit = now
                 elif self.pan_active and (
                     len(active) >= 3 or self.two_mode == "zoom"
                 ):
@@ -890,6 +950,7 @@ class MTWatcher:
             except (OSError, PermissionError):
                 if self.dragging:
                     mouse_left_up()
+                self.release_draw()
                 self.release_pan()
                 time.sleep(1)
 

@@ -25,6 +25,7 @@ static int sync_events(void) {
 
 static void cleanup(void) {
     if (fd >= 0) {
+        emit(EV_KEY, BTN_LEFT, 0);
         emit(EV_KEY, BTN_MIDDLE, 0);
         sync_events();
         ioctl(fd, UI_DEV_DESTROY);
@@ -41,6 +42,7 @@ int main(void) {
     }
 
     if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 ||
+        ioctl(fd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
         ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE) < 0 ||
         ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
         ioctl(fd, UI_SET_RELBIT, REL_X) < 0 ||
@@ -73,6 +75,12 @@ int main(void) {
             sync_events();
         } else if (line[0] == 'U') {
             emit(EV_KEY, BTN_MIDDLE, 0);
+            sync_events();
+        } else if (line[0] == 'L') {
+            emit(EV_KEY, BTN_LEFT, 1);
+            sync_events();
+        } else if (line[0] == 'R') {
+            emit(EV_KEY, BTN_LEFT, 0);
             sync_events();
         } else if (line[0] == 'M') {
             int dx = 0, dy = 0;
