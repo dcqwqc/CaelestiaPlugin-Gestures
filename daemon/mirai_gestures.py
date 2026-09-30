@@ -33,12 +33,13 @@ ABS_MT_POSITION_X = 0x35
 ABS_MT_POSITION_Y = 0x36
 ABS_MT_TRACKING_ID = 0x39
 
-TOUCHPAD_NAME = "touchpad"
+TOUCHPAD_NAME = "elan06fa:00 04f3:327e touchpad"
 TOUCHPAD_HYPR_NAME = "elan06fa:00-04f3:327e-touchpad"
 TOUCHSCREEN_NAME = "wacom hid 53b7 finger"
 TOUCHSCREEN_HYPR_NAME = "wacom-hid-53b7-finger"
 TOUCHSCREEN_OUTPUT = "eDP-1"
 REMOTE = str(Path.home() / ".local/bin/kagami-remote")
+UINPUT_MOUSE = str(Path.home() / ".local/libexec/mirai-uinput-mouse")
 
 TAP_MAX_SECONDS = 0.50
 TAP_MAX_MOVE = 180.0
@@ -113,6 +114,61 @@ def mouse_middle_down() -> None:
 
 def mouse_middle_up() -> None:
     ydotool_sync("click", "0x82")
+
+
+_touch_mouse_proc: subprocess.Popen[str] | None = None
+_touch_mouse_lock = threading.Lock()
+
+
+def ensure_touch_mouse() -> subprocess.Popen[str] | None:
+    global _touch_mouse_proc
+    with _touch_mouse_lock:
+        if _touch_mouse_proc is not None and _touch_mouse_proc.poll() is None:
+            return _touch_mouse_proc
+        try:
+            _touch_mouse_proc = subprocess.Popen(
+                [UINPUT_MOUSE],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                close_fds=True,
+            )
+            return _touch_mouse_proc
+        except OSError as e:
+            log(f"uinput mouse start failed: {e}")
+            _touch_mouse_proc = None
+            return None
+
+
+def touch_mouse_command(command: str) -> bool:
+    global _touch_mouse_proc
+    for _attempt in range(2):
+        proc = ensure_touch_mouse()
+        if proc is None or proc.stdin is None:
+            return False
+        try:
+            proc.stdin.write(command + "\n")
+            proc.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError):
+            with _touch_mouse_lock:
+                _touch_mouse_proc = None
+    return False
+
+
+def touch_mouse_middle_down() -> None:
+    touch_mouse_command("D")
+
+
+def touch_mouse_middle_up() -> None:
+    touch_mouse_command("U")
+
+
+def touch_mouse_move(dx: int, dy: int) -> None:
+    if dx or dy:
+        touch_mouse_command(f"M {int(dx)} {int(dy)}")
 
 
 def hypr_socket_path() -> str:
@@ -366,6 +422,7 @@ class MTWatcher:
         self.abs_y_max = 1
         self.pan_active = False
         self.pan_last_emit = 0.0
+        self.pan_last_centroid: tuple[float, float] | None = None
         self.touch_geometry = (0, 0, 1440, 900, 0)
 
     def state_for(self, idx: int) -> dict[str, int | None]:
@@ -385,13 +442,38 @@ class MTWatcher:
         except ValueError:
             return (0, 0)
 
+    def pan_button_down(self) -> None:
+        if self.kind == "touchscreen":
+            touch_mouse_middle_down()
+        else:
+            mouse_middle_down()
+
+    def pan_button_up(self) -> None:
+        if self.kind == "touchscreen":
+            touch_mouse_middle_up()
+        else:
+            mouse_middle_up()
+
     def pan_delta_to_cursor(self, dx: float, dy: float) -> None:
-        # Convert raw-device centroid movement to logical screen pixels.
         _, _, width, height, _ = self.touch_geometry
         px = dx / max(1, self.abs_x_max - self.abs_x_min) * width
         py = dy / max(1, self.abs_y_max - self.abs_y_min) * height
         cx, cy = self.current_cursor()
         move_cursor(round(cx + px), round(cy + py))
+
+    def pan_delta_to_uinput(self, dx: float, dy: float) -> None:
+        _, _, width, height, transform = self.touch_geometry
+        ndx = dx / max(1, self.abs_x_max - self.abs_x_min)
+        ndy = dy / max(1, self.abs_y_max - self.abs_y_min)
+        if transform == 1:
+            px, py = -ndy * width, ndx * height
+        elif transform == 2:
+            px, py = -ndx * width, -ndy * height
+        elif transform == 3:
+            px, py = ndy * width, -ndx * height
+        else:
+            px, py = ndx * width, ndy * height
+        touch_mouse_move(round(px), round(py))
 
     def touch_to_cursor(self, x: int, y: int) -> tuple[int, int]:
         nx = (x - self.abs_x_min) / max(1, self.abs_x_max - self.abs_x_min)
@@ -415,7 +497,7 @@ class MTWatcher:
 
     def release_pan(self) -> None:
         if self.pan_active:
-            mouse_middle_up()
+            self.pan_button_up()
             self.pan_active = False
             log(f"{self.kind} pan -> end")
 
@@ -441,6 +523,7 @@ class MTWatcher:
         self.dragging = False
         self.pan_active = False
         self.pan_last_emit = 0.0
+        self.pan_last_centroid = None
 
     def begin(self, active: list[dict[str, int | None]], centroid: tuple[float, float] | None) -> None:
         now = time.monotonic()
@@ -454,9 +537,10 @@ class MTWatcher:
             self.touch_geometry = touchscreen_logical_geometry()
             cx, cy = self.touch_to_cursor(round(centroid[0]), round(centroid[1]))
             move_cursor(cx, cy)
-            mouse_middle_down()
+            self.pan_button_down()
             self.pan_active = True
             self.pan_last_emit = now
+            self.pan_last_centroid = centroid
             log("touchscreen one-finger -> Aseprite pan (immediate)")
 
     @staticmethod
@@ -496,11 +580,12 @@ class MTWatcher:
                 # Direct touch should feel immediate. Start as canvas pan as
                 # soon as the second finger is established; a deliberate scale
                 # change can still promote this gesture to zoom below.
-                px, py = self.touch_to_cursor(round(cx), round(cy))
-                move_cursor(px, py)
                 if not self.pan_active:
-                    mouse_middle_down()
+                    px, py = self.touch_to_cursor(round(cx), round(cy))
+                    move_cursor(px, py)
+                    self.pan_button_down()
                     self.pan_active = True
+                self.pan_last_centroid = (cx, cy)
                 self.two_mode = "pan"
                 log("touchscreen two-finger -> PAN immediate")
             return
@@ -571,7 +656,7 @@ class MTWatcher:
                 self.two_mode = "pan"
                 self.pinch_active = False
                 if not self.pan_active:
-                    mouse_middle_down()
+                    self.pan_button_down()
                     self.pan_active = True
                 log(
                     f"{self.kind} two-finger -> PAN "
@@ -595,10 +680,10 @@ class MTWatcher:
             if self.two_last_centroid is not None:
                 last_cx, last_cy = self.two_last_centroid
                 dx, dy = cx - last_cx, cy - last_cy
-                # Aseprite/XWayland responds reliably to relative drag motion.
-                # Absolute cursor warps visually moved the hand cursor but did
-                # not make the canvas track it consistently.
-                self.pan_delta_to_cursor(dx, dy)
+                if self.kind == "touchscreen":
+                    self.pan_delta_to_uinput(dx, dy)
+                else:
+                    self.pan_delta_to_cursor(dx, dy)
 
         self.two_last_centroid = (cx, cy)
         self.two_last_distance = distance
@@ -693,8 +778,10 @@ class MTWatcher:
             if self.kind == "touchscreen" and aseprite_active():
                 if len(active) == 1 and len(positioned) == 1:
                     if self.pan_active and now - self.pan_last_emit >= 0.004:
-                        px, py = self.touch_to_cursor(round(c[0]), round(c[1]))
-                        move_cursor(px, py)
+                        if self.pan_last_centroid is not None:
+                            last_x, last_y = self.pan_last_centroid
+                            self.pan_delta_to_uinput(c[0] - last_x, c[1] - last_y)
+                        self.pan_last_centroid = c
                         self.pan_last_emit = now
                 elif self.pan_active and self.two_mode != "pan":
                     # Only release the immediate one-finger grab while a
@@ -787,6 +874,12 @@ def control(action: str) -> int:
 
 
 def daemon() -> None:
+    ensure_touch_mouse()
+    time.sleep(0.08)
+    hypr_eval(
+        'hl.device({ name = "mirai-gesture-mouse", accel_profile = "flat", sensitivity = 0.0 })',
+        "gesture mouse flat profile",
+    )
     workers = [MTWatcher("touchpad"), MTWatcher("touchscreen")]
     threads = [threading.Thread(target=w.run_forever, daemon=True, name=f"mirai-{w.kind}") for w in workers]
     policy = threading.Thread(target=touch_policy_loop, daemon=True, name="mirai-touch-policy")
