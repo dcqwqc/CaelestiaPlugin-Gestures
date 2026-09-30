@@ -2,7 +2,9 @@
 """Mirai's low-level touchpad/touchscreen gesture bridge.
 
 Design constraints:
-- never EVIOCGRAB input devices; native movement/scroll/pen input stays native
+- native touchscreen input stays completely untouched outside Aseprite
+- while Aseprite is focused, EVIOCGRAB gives the daemon exclusive ownership
+  of only the touchscreen event node; releasing the grab restores native touch
 - touchpad taps are re-emitted because native tap_to_click is disabled on Mirai
   so 3-finger tap can mean Undo without also producing a middle click
 - preserve the existing four-finger Remote Desktop swipe
@@ -32,6 +34,7 @@ ABS_MT_SLOT = 0x2F
 ABS_MT_POSITION_X = 0x35
 ABS_MT_POSITION_Y = 0x36
 ABS_MT_TRACKING_ID = 0x39
+EVIOCGRAB = 0x40044590
 
 TOUCHPAD_NAME = "elan06fa:00 04f3:327e touchpad"
 TOUCHPAD_HYPR_NAME = "elan06fa:00-04f3:327e-touchpad"
@@ -277,7 +280,7 @@ def aseprite_active() -> bool:
 
 
 _touch_policy_lock = threading.Lock()
-_touch_disabled_for_aseprite = False
+_touch_bridge_active = False
 
 
 def configured_touchpad_scroll_factor() -> float:
@@ -319,57 +322,43 @@ def set_touchpad_scroll_factor(value: float) -> bool:
     return hypr_eval(expr, f"touchpad scroll_factor={value:g}")
 
 
-def set_touchscreen_enabled(enabled: bool) -> bool:
-    value = "true" if enabled else "false"
-    expr = (
-        'hl.device({ name = "' + TOUCHSCREEN_HYPR_NAME +
-        '", enabled = ' + value + ' })'
-    )
-    return hypr_eval(expr, f"touchscreen enabled={value}")
-
-
-def touch_policy_loop() -> None:
-    global _touch_disabled_for_aseprite
+def touch_policy_loop(touchscreen: "MTWatcher") -> None:
+    global _touch_bridge_active
     native_scroll = configured_touchpad_scroll_factor()
-    last_enforce = 0.0
+
     while True:
         want_bridge = aseprite_active()
-        now = time.monotonic()
-        transition = want_bridge != _touch_disabled_for_aseprite
 
-        # Hyprland can occasionally return "ok" for a live device mutation
-        # while the touch device is still settling/reappearing. Re-assert the
-        # intended state periodically so a single flaky transition can never
-        # leave the touchscreen permanently disabled.
-        periodic_reassert = now - last_enforce >= 0.75
+        with _touch_policy_lock:
+            if want_bridge != _touch_bridge_active:
+                # Do NOT mutate Hyprland's touchscreen config. Runtime
+                # enabled=true/false was found to corrupt native touch mapping
+                # on this machine. Instead, grab the kernel event node only
+                # while Aseprite is focused and release it everywhere else.
+                grab_ok = touchscreen.set_exclusive(want_bridge)
 
-        if transition or periodic_reassert:
-            with _touch_policy_lock:
-                touch_ok = set_touchscreen_enabled(not want_bridge)
                 scroll_ok = set_touchpad_scroll_factor(
                     0.0 if want_bridge else native_scroll
                 )
-                last_enforce = now
 
-                if touch_ok:
-                    changed = transition
-                    _touch_disabled_for_aseprite = want_bridge
-                    if changed:
-                        log(
-                            (
-                                "Aseprite bridge -> touchscreen raw + touchpad raw 2-finger"
-                                if want_bridge
-                                else "input -> native Hyprland"
-                            )
-                            + (
-                                " (touchpad scroll updated)"
-                                if scroll_ok
-                                else " (touchpad scroll update FAILED)"
-                            )
+                if grab_ok:
+                    _touch_bridge_active = want_bridge
+                    log(
+                        (
+                            "Aseprite bridge -> touchscreen EVIOCGRAB + touchpad raw 2-finger"
+                            if want_bridge
+                            else "input -> native Hyprland touchscreen"
                         )
+                        + (
+                            " (touchpad scroll updated)"
+                            if scroll_ok
+                            else " (touchpad scroll update FAILED)"
+                        )
+                    )
                 else:
-                    log("touchscreen policy reassert failed; retrying")
-        time.sleep(0.05)
+                    log("touchscreen EVIOCGRAB transition failed; retrying")
+
+        time.sleep(0.04)
 
 
 def touchscreen_logical_geometry() -> tuple[int, int, int, int, int]:
@@ -459,6 +448,33 @@ class MTWatcher:
         self.draw_last_emit = 0.0
         self.draw_last_centroid: tuple[float, float] | None = None
         self.touch_geometry = (0, 0, 1440, 900, 0)
+
+        self.input_fd: int | None = None
+        self.input_fd_lock = threading.Lock()
+        self.input_grabbed = False
+
+    def set_exclusive(self, enabled: bool) -> bool:
+        if self.kind != "touchscreen":
+            return True
+
+        with self.input_fd_lock:
+            fd = self.input_fd
+            if fd is None:
+                # Watcher may still be opening/re-opening the event node.
+                return not enabled
+
+            if self.input_grabbed == enabled:
+                return True
+
+            try:
+                fcntl.ioctl(fd, EVIOCGRAB, 1 if enabled else 0)
+            except OSError as e:
+                log(f"touchscreen EVIOCGRAB {'on' if enabled else 'off'} failed: {e}")
+                return False
+
+            self.input_grabbed = enabled
+            log(f"touchscreen EVIOCGRAB -> {'exclusive' if enabled else 'released'}")
+            return True
 
     def state_for(self, idx: int) -> dict[str, int | None]:
         return self.slots.setdefault(idx, {"id": None, "x": None, "y": None})
@@ -919,35 +935,50 @@ class MTWatcher:
         self.slots.clear()
         self.reset_session()
         with open(device, "rb", buffering=0) as f:
+            with self.input_fd_lock:
+                self.input_fd = f.fileno()
+                self.input_grabbed = False
+
             try:
-                self.abs_x_min, self.abs_x_max = read_abs_range(f.fileno(), ABS_MT_POSITION_X)
-                self.abs_y_min, self.abs_y_max = read_abs_range(f.fileno(), ABS_MT_POSITION_Y)
-                log(
-                    f"{self.kind} abs x={self.abs_x_min}..{self.abs_x_max} "
-                    f"y={self.abs_y_min}..{self.abs_y_max}"
-                )
-            except OSError as e:
-                log(f"{self.kind} abs range read failed: {e}")
-            while True:
-                data = f.read(EVENT.size)
-                if len(data) != EVENT.size:
-                    raise OSError("input event stream ended")
-                _sec, _usec, ev_type, code, value = EVENT.unpack(data)
-                if ev_type == EV_ABS:
-                    if code == ABS_MT_SLOT:
-                        self.slot = value
-                    elif code == ABS_MT_TRACKING_ID:
-                        s = self.state_for(self.slot)
-                        if value < 0:
-                            s["id"] = None; s["x"] = None; s["y"] = None
-                        else:
-                            s["id"] = value; s["x"] = None; s["y"] = None
-                    elif code == ABS_MT_POSITION_X:
-                        self.state_for(self.slot)["x"] = value
-                    elif code == ABS_MT_POSITION_Y:
-                        self.state_for(self.slot)["y"] = value
-                elif ev_type == EV_SYN and code == SYN_REPORT:
-                    self.report()
+                try:
+                    self.abs_x_min, self.abs_x_max = read_abs_range(f.fileno(), ABS_MT_POSITION_X)
+                    self.abs_y_min, self.abs_y_max = read_abs_range(f.fileno(), ABS_MT_POSITION_Y)
+                    log(
+                        f"{self.kind} abs x={self.abs_x_min}..{self.abs_x_max} "
+                        f"y={self.abs_y_min}..{self.abs_y_max}"
+                    )
+                except OSError as e:
+                    log(f"{self.kind} abs range read failed: {e}")
+
+                while True:
+                    data = f.read(EVENT.size)
+                    if len(data) != EVENT.size:
+                        raise OSError("input event stream ended")
+                    _sec, _usec, ev_type, code, value = EVENT.unpack(data)
+                    if ev_type == EV_ABS:
+                        if code == ABS_MT_SLOT:
+                            self.slot = value
+                        elif code == ABS_MT_TRACKING_ID:
+                            st = self.state_for(self.slot)
+                            if value < 0:
+                                st["id"] = None; st["x"] = None; st["y"] = None
+                            else:
+                                st["id"] = value; st["x"] = None; st["y"] = None
+                        elif code == ABS_MT_POSITION_X:
+                            self.state_for(self.slot)["x"] = value
+                        elif code == ABS_MT_POSITION_Y:
+                            self.state_for(self.slot)["y"] = value
+                    elif ev_type == EV_SYN and code == SYN_REPORT:
+                        self.report()
+            finally:
+                with self.input_fd_lock:
+                    if self.input_grabbed:
+                        try:
+                            fcntl.ioctl(f.fileno(), EVIOCGRAB, 0)
+                        except OSError:
+                            pass
+                    self.input_grabbed = False
+                    self.input_fd = None
 
     def run_forever(self) -> None:
         while True:
@@ -980,24 +1011,31 @@ def control(action: str) -> int:
 
 
 def daemon() -> None:
-    # Always recover native touch first. If a previous process died while
-    # Aseprite owned the raw touchscreen, Hyprland may still have the physical
-    # device disabled.
-    set_touchscreen_enabled(True)
-    set_touchpad_scroll_factor(configured_touchpad_scroll_factor())
-
     ensure_touch_mouse()
     time.sleep(0.08)
     hypr_eval(
         'hl.device({ name = "mirai-gesture-mouse", accel_profile = "flat", sensitivity = 0.0 })',
         "gesture mouse flat profile",
     )
-    workers = [MTWatcher("touchpad"), MTWatcher("touchscreen")]
-    threads = [threading.Thread(target=w.run_forever, daemon=True, name=f"mirai-{w.kind}") for w in workers]
-    policy = threading.Thread(target=touch_policy_loop, daemon=True, name="mirai-touch-policy")
+
+    touchpad = MTWatcher("touchpad")
+    touchscreen = MTWatcher("touchscreen")
+    workers = [touchpad, touchscreen]
+    threads = [
+        threading.Thread(target=w.run_forever, daemon=True, name=f"mirai-{w.kind}")
+        for w in workers
+    ]
+    policy = threading.Thread(
+        target=touch_policy_loop,
+        args=(touchscreen,),
+        daemon=True,
+        name="mirai-touch-policy",
+    )
+
     for t in threads:
         t.start()
     policy.start()
+
     try:
         while True:
             for t in threads:
@@ -1007,7 +1045,7 @@ def daemon() -> None:
                 raise RuntimeError("gesture policy worker stopped")
             time.sleep(5)
     finally:
-        set_touchscreen_enabled(True)
+        touchscreen.set_exclusive(False)
         set_touchpad_scroll_factor(configured_touchpad_scroll_factor())
 
 
