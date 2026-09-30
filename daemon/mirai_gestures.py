@@ -47,8 +47,11 @@ DRAG_START_MOVE = 70.0
 REMOTE_SWIPE_DISTANCE = 500.0
 REMOTE_COOLDOWN = 0.85
 TWO_PAN_START = 0.008        # normalized centroid travel (~0.8% of pad/screen)
-TWO_ZOOM_START_LOG = 0.040    # ~4% genuine scale change before zoom locks in
-TWO_ZOOM_DOMINANCE = 1.30    # scale change must beat centroid translation
+TWO_ZOOM_START_LOG = 0.040    # touchpad: ~4% scale change before zoom locks in
+TWO_ZOOM_DOMINANCE = 1.30    # touchpad scale change vs centroid translation
+TOUCH_ZOOM_START_LOG = 0.10  # touchscreen: ~10.5% spacing change, filters finger jitter
+TOUCH_ZOOM_DOMINANCE = 1.80  # touchscreen pinch must clearly dominate translation
+TOUCH_ZOOM_CONFIRM_FRAMES = 3
 PINCH_TICKS_PER_LOG = 12.0    # gentler: one wheel notch per ~8.7% scale change
 PINCH_TICK_LIMIT = 1          # avoid bursty jumps from one frame
 
@@ -347,6 +350,7 @@ class MTWatcher:
         self.two_last_centroid: tuple[float, float] | None = None
         self.two_start_distance: float | None = None
         self.two_last_distance: float | None = None
+        self.two_zoom_candidate_frames = 0
         self.remote_fired = False
         self.last_remote = 0.0
         self.last_single_tap = -999.0
@@ -428,6 +432,7 @@ class MTWatcher:
         self.two_last_centroid = None
         self.two_start_distance = None
         self.two_last_distance = None
+        self.two_zoom_candidate_frames = 0
         self.remote_fired = False
         self.drag_candidate = False
         self.dragging = False
@@ -506,18 +511,25 @@ class MTWatcher:
         # dominates translation.
         if self.kind == "touchscreen" and self.two_mode == "pan":
             zoom_strength = abs(total_scale_log)
-            if (
-                zoom_strength >= TWO_ZOOM_START_LOG
-                and zoom_strength >= centroid_travel * TWO_ZOOM_DOMINANCE
-            ):
+            looks_like_pinch = (
+                zoom_strength >= TOUCH_ZOOM_START_LOG
+                and zoom_strength >= centroid_travel * TOUCH_ZOOM_DOMINANCE
+            )
+            if looks_like_pinch:
+                self.two_zoom_candidate_frames += 1
+            else:
+                self.two_zoom_candidate_frames = 0
+
+            if self.two_zoom_candidate_frames >= TOUCH_ZOOM_CONFIRM_FRAMES:
                 self.two_mode = "zoom"
                 self.pinch_active = True
                 self.release_pan()
                 self.pinch_accum = 0.0
                 self.two_last_distance = distance
                 log(
-                    f"touchscreen PAN -> ZOOM "
-                    f"scale={zoom_strength:.3f} translate={centroid_travel:.3f}"
+                    f"touchscreen PAN -> ZOOM confirmed "
+                    f"scale={zoom_strength:.3f} translate={centroid_travel:.3f} "
+                    f"frames={self.two_zoom_candidate_frames}"
                 )
 
         # Touchpad still waits for classification, because native touchpad
@@ -645,12 +657,16 @@ class MTWatcher:
             if self.max_fingers > 1:
                 self.drag_candidate = False
             if self.max_fingers == 2:
-                self.release_pan()
+                # Keep the touchscreen middle-button grab held while a second
+                # finger joins. This makes 1->2 finger panning continuous.
+                if self.kind != "touchscreen":
+                    self.release_pan()
                 self.two_mode = None
                 self.two_start_centroid = None
                 self.two_last_centroid = None
                 self.two_start_distance = None
                 self.two_last_distance = None
+                self.two_zoom_candidate_frames = 0
                 self.pinch_active = False
                 self.pinch_accum = 0.0
 
