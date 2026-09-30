@@ -49,9 +49,10 @@ REMOTE_COOLDOWN = 0.85
 TWO_PAN_START = 0.008        # normalized centroid travel (~0.8% of pad/screen)
 TWO_ZOOM_START_LOG = 0.040    # touchpad: ~4% scale change before zoom locks in
 TWO_ZOOM_DOMINANCE = 1.30    # touchpad scale change vs centroid translation
-TOUCH_ZOOM_START_LOG = 0.10  # touchscreen: ~10.5% spacing change, filters finger jitter
-TOUCH_ZOOM_DOMINANCE = 1.80  # touchscreen pinch must clearly dominate translation
+TOUCH_ZOOM_START_LOG = 0.075  # early pinch evidence (~7.8% scale change)
+TOUCH_ZOOM_DOMINANCE = 2.20   # pinch must strongly dominate translation
 TOUCH_ZOOM_CONFIRM_FRAMES = 3
+TOUCH_PAN_COMMIT = 0.012      # ~1.2% screen translation permanently locks PAN
 PINCH_TICKS_PER_LOG = 12.0    # gentler: one wheel notch per ~8.7% scale change
 PINCH_TICK_LIMIT = 1          # avoid bursty jumps from one frame
 
@@ -351,6 +352,7 @@ class MTWatcher:
         self.two_start_distance: float | None = None
         self.two_last_distance: float | None = None
         self.two_zoom_candidate_frames = 0
+        self.two_pan_committed = False
         self.remote_fired = False
         self.last_remote = 0.0
         self.last_single_tap = -999.0
@@ -433,6 +435,7 @@ class MTWatcher:
         self.two_start_distance = None
         self.two_last_distance = None
         self.two_zoom_candidate_frames = 0
+        self.two_pan_committed = False
         self.remote_fired = False
         self.drag_candidate = False
         self.dragging = False
@@ -506,31 +509,44 @@ class MTWatcher:
         centroid_travel = math.hypot(ncx - sx, ncy - sy)
         total_scale_log = math.log(distance / self.two_start_distance)
 
-        # Direct touchscreen starts in PAN immediately, but a deliberate pinch
-        # should still win. Promote PAN -> ZOOM once scale change clearly
-        # dominates translation.
+        # Touchscreen intent is decided only at the start of the gesture.
+        # Once the centroid has translated enough to mean "move canvas", PAN
+        # is committed for the rest of this contact sequence. This prevents
+        # finger-spacing drift during a long pan from suddenly cancelling the
+        # middle-button grab and turning into zoom.
         if self.kind == "touchscreen" and self.two_mode == "pan":
             zoom_strength = abs(total_scale_log)
-            looks_like_pinch = (
-                zoom_strength >= TOUCH_ZOOM_START_LOG
-                and zoom_strength >= centroid_travel * TOUCH_ZOOM_DOMINANCE
-            )
-            if looks_like_pinch:
-                self.two_zoom_candidate_frames += 1
-            else:
+
+            if centroid_travel >= TOUCH_PAN_COMMIT:
+                if not self.two_pan_committed:
+                    log(
+                        f"touchscreen PAN committed "
+                        f"translate={centroid_travel:.3f} scale={zoom_strength:.3f}"
+                    )
+                self.two_pan_committed = True
                 self.two_zoom_candidate_frames = 0
 
-            if self.two_zoom_candidate_frames >= TOUCH_ZOOM_CONFIRM_FRAMES:
-                self.two_mode = "zoom"
-                self.pinch_active = True
-                self.release_pan()
-                self.pinch_accum = 0.0
-                self.two_last_distance = distance
-                log(
-                    f"touchscreen PAN -> ZOOM confirmed "
-                    f"scale={zoom_strength:.3f} translate={centroid_travel:.3f} "
-                    f"frames={self.two_zoom_candidate_frames}"
+            if not self.two_pan_committed:
+                looks_like_pinch = (
+                    zoom_strength >= TOUCH_ZOOM_START_LOG
+                    and zoom_strength >= centroid_travel * TOUCH_ZOOM_DOMINANCE
                 )
+                if looks_like_pinch:
+                    self.two_zoom_candidate_frames += 1
+                else:
+                    self.two_zoom_candidate_frames = 0
+
+                if self.two_zoom_candidate_frames >= TOUCH_ZOOM_CONFIRM_FRAMES:
+                    self.two_mode = "zoom"
+                    self.pinch_active = True
+                    self.release_pan()
+                    self.pinch_accum = 0.0
+                    self.two_last_distance = distance
+                    log(
+                        f"touchscreen PAN -> ZOOM confirmed "
+                        f"scale={zoom_strength:.3f} translate={centroid_travel:.3f} "
+                        f"frames={self.two_zoom_candidate_frames}"
+                    )
 
         # Touchpad still waits for classification, because native touchpad
         # movement is much noisier and accidental pan should be avoided.
@@ -579,11 +595,10 @@ class MTWatcher:
             if self.two_last_centroid is not None:
                 last_cx, last_cy = self.two_last_centroid
                 dx, dy = cx - last_cx, cy - last_cy
-                if self.kind == "touchscreen":
-                    px, py = self.touch_to_cursor(round(cx), round(cy))
-                    move_cursor(px, py)
-                else:
-                    self.pan_delta_to_cursor(dx, dy)
+                # Aseprite/XWayland responds reliably to relative drag motion.
+                # Absolute cursor warps visually moved the hand cursor but did
+                # not make the canvas track it consistently.
+                self.pan_delta_to_cursor(dx, dy)
 
         self.two_last_centroid = (cx, cy)
         self.two_last_distance = distance
@@ -667,6 +682,7 @@ class MTWatcher:
                 self.two_start_distance = None
                 self.two_last_distance = None
                 self.two_zoom_candidate_frames = 0
+                self.two_pan_committed = False
                 self.pinch_active = False
                 self.pinch_accum = 0.0
 
