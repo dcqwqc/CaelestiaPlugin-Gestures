@@ -48,3 +48,8 @@ leaves Aseprite, native Hyprland touchscreen handling is restored automatically.
   IPC socket directly instead of spawning hyprctl for every frame.
 - Middle-button press/release is synchronous so Aseprite always sees the grab
   before the first cursor movement.
+
+
+- Touchscreen two-finger PAN keeps the synthetic middle-button hold alive across
+  successive multi-touch frames; the one-finger cleanup path must not release
+  a gesture after the two-finger classifier has locked to PAN.

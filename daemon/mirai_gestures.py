@@ -617,7 +617,11 @@ class MTWatcher:
                         px, py = self.touch_to_cursor(round(c[0]), round(c[1]))
                         move_cursor(px, py)
                         self.pan_last_emit = now
-                elif self.pan_active:
+                elif self.pan_active and self.two_mode != "pan":
+                    # Only release the immediate one-finger grab while a
+                    # second contact is still being classified. Once the
+                    # two-finger recognizer locks to PAN, keep middle held
+                    # across all subsequent touch frames until lift-off.
                     self.release_pan()
 
             if self.kind == "touchpad" and self.drag_candidate and self.max_fingers == 1 and not self.dragging and move >= DRAG_START_MOVE:
