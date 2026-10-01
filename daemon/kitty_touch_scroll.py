@@ -13,6 +13,7 @@ import fcntl
 import glob
 import json
 import math
+from collections import deque
 import os
 from pathlib import Path
 import struct
@@ -32,14 +33,30 @@ ABS_MT_TRACKING_ID = 0x39
 TOUCHSCREEN_NAME = "wacom hid 53b7 finger"
 TOUCHSCREEN_OUTPUT = "eDP-1"
 
-# Gesture tuning in logical compositor pixels.
-COMMIT_PX = 11.0
-VERTICAL_DOMINANCE = 1.20
-WHEEL_STEP_PX = 18.0
-EMIT_INTERVAL = 0.022
-MAX_TICKS_PER_EMIT = 3
+# Direct-manipulation tuning in logical compositor pixels.
+#
+# Kitty is configured below to scroll exactly one terminal row per synthetic
+# wheel notch. At 11 pt and cell_height 90%, one row is ~13.2 logical px:
+# 11 pt * 96/72 px/pt * 0.90. Therefore one row of content moves for roughly
+# one row of finger travel, keeping the touched text line visually anchored.
+COMMIT_PX = 5.0
+VERTICAL_DOMINANCE = 1.15
+LINE_PX = 13.2
+EMIT_INTERVAL = 0.010
+MAX_TICKS_PER_EMIT = 4
 
-STATE_POLL_INTERVAL = 0.08
+# Kinetic scrolling uses the actual release velocity measured over the most
+# recent touch samples. It starts at that speed, then loses speed smoothly.
+VELOCITY_WINDOW = 0.110
+VELOCITY_FRESHNESS = 0.060
+MOMENTUM_MIN_SPEED = 90.0
+MOMENTUM_MAX_SPEED = 3000.0
+MOMENTUM_STOP_SPEED = 35.0
+MOMENTUM_FRICTION = 3.8
+MOMENTUM_FRAME = 1.0 / 60.0
+
+STATE_POLL_INTERVAL = 0.18
+MONITOR_POLL_INTERVAL = 2.0
 YDOTOOL_SOCKET = f"/run/user/{os.getuid()}/.ydotool_socket"
 
 
@@ -98,6 +115,7 @@ class DesktopState:
             "scale": 2.0,
             "transform": 0,
         }
+        self.last_monitor_poll = 0.0
 
     def snapshot(self) -> tuple[dict | None, dict]:
         with self.lock:
@@ -115,13 +133,16 @@ class DesktopState:
             if "kitty" in ident:
                 kitty = active
 
-        monitors = run_json("monitors", "-j")
         monitor = None
-        if isinstance(monitors, list):
-            monitor = next(
-                (m for m in monitors if m.get("name") == TOUCHSCREEN_OUTPUT),
-                None,
-            )
+        now = time.monotonic()
+        if now - self.last_monitor_poll >= MONITOR_POLL_INTERVAL:
+            monitors = run_json("monitors", "-j")
+            if isinstance(monitors, list):
+                monitor = next(
+                    (m for m in monitors if m.get("name") == TOUCHSCREEN_OUTPUT),
+                    None,
+                )
+            self.last_monitor_poll = now
 
         with self.lock:
             self.kitty_window = kitty
@@ -238,18 +259,112 @@ class KittyTouchScroll:
         self.accum_y = 0.0
         self.last_emit = 0.0
         self.total_ticks = 0
+        self.motion_samples: deque[tuple[float, float]] = deque(maxlen=32)
+        self.momentum_lock = threading.Lock()
+        self.momentum_generation = 0
 
     def state_for(self, slot: int) -> dict[str, int | None]:
         return self.slots.setdefault(slot, {"id": None, "x": None, "y": None})
 
-    def finish(self) -> None:
+    def cancel_momentum(self) -> None:
+        with self.momentum_lock:
+            self.momentum_generation += 1
+
+    def release_velocity(self) -> float:
+        now = time.monotonic()
+        if len(self.motion_samples) < 2:
+            return 0.0
+
+        samples = list(self.motion_samples)
+        last_t, last_y = samples[-1]
+        if now - last_t > VELOCITY_FRESHNESS:
+            return 0.0
+
+        cutoff = last_t - VELOCITY_WINDOW
+        first_t, first_y = samples[0]
+        for sample_t, sample_y in samples:
+            if sample_t >= cutoff:
+                first_t, first_y = sample_t, sample_y
+                break
+
+        dt = last_t - first_t
+        if dt < 0.020:
+            return 0.0
+
+        velocity = (last_y - first_y) / dt
+        return max(-MOMENTUM_MAX_SPEED, min(MOMENTUM_MAX_SPEED, velocity))
+
+    def momentum_loop(self, generation: int, velocity: float) -> None:
+        if abs(velocity) < MOMENTUM_MIN_SPEED:
+            return
+
+        log(f"momentum -> start velocity={velocity:.0f}px/s")
+        accum = 0.0
+        previous = time.monotonic()
+
+        while abs(velocity) >= MOMENTUM_STOP_SPEED:
+            with self.momentum_lock:
+                if generation != self.momentum_generation:
+                    log("momentum -> cancelled")
+                    return
+
+            window, _monitor = self.desktop.snapshot()
+            if window is None:
+                log("momentum -> stopped (Kitty focus lost)")
+                return
+
+            now = time.monotonic()
+            dt = min(0.040, max(0.001, now - previous))
+            previous = now
+
+            # Integrate the current release velocity first so the first kinetic
+            # frame continues at the exact speed the finger had at lift.
+            accum += velocity * dt
+            ticks = math.trunc(accum / LINE_PX)
+            if ticks:
+                ticks = max(-MAX_TICKS_PER_EMIT, min(MAX_TICKS_PER_EMIT, ticks))
+                accum -= ticks * LINE_PX
+                wheel(ticks)
+
+            velocity *= math.exp(-MOMENTUM_FRICTION * dt)
+            time.sleep(MOMENTUM_FRAME)
+
+        log("momentum -> end")
+
+    def start_momentum(self, velocity: float) -> None:
+        if abs(velocity) < MOMENTUM_MIN_SPEED:
+            return
+
+        with self.momentum_lock:
+            self.momentum_generation += 1
+            generation = self.momentum_generation
+
+        threading.Thread(
+            target=self.momentum_loop,
+            args=(generation, velocity),
+            daemon=True,
+            name="kitty-touch-momentum",
+        ).start()
+
+    def finish(self, momentum: bool = False) -> None:
+        velocity = self.release_velocity() if self.committed and momentum else 0.0
         if self.committed:
-            log(f"one-finger Kitty scroll -> end ticks={self.total_ticks}")
+            log(
+                f"one-finger Kitty scroll -> end ticks={self.total_ticks} "
+                f"release={velocity:.0f}px/s"
+            )
+
         self.tracking = False
         self.committed = False
         self.started_inside = False
         self.accum_y = 0.0
         self.total_ticks = 0
+        self.motion_samples.clear()
+
+        if momentum:
+            self.start_momentum(velocity)
+        else:
+            self.cancel_momentum()
 
     def report(self) -> None:
         active = [s for s in self.slots.values() if s["id"] is not None]
@@ -261,7 +376,7 @@ class KittyTouchScroll:
         # Two or more fingers remain entirely native and are ignored here.
         if len(active) != 1 or len(positioned) != 1:
             if self.tracking:
-                self.finish()
+                self.finish(momentum=(len(active) == 0))
             return
 
         window, monitor = self.desktop.snapshot()
@@ -283,6 +398,7 @@ class KittyTouchScroll:
         )
 
         if not self.tracking:
+            self.cancel_momentum()
             self.tracking = True
             self.started_inside = point_inside_window(x, y, window)
             self.start_x = x
@@ -291,11 +407,15 @@ class KittyTouchScroll:
             self.accum_y = 0.0
             self.total_ticks = 0
             self.last_emit = 0.0
+            self.motion_samples.clear()
+            self.motion_samples.append((time.monotonic(), y))
             return
 
         if not self.started_inside:
             self.last_y = y
             return
+
+        self.motion_samples.append((time.monotonic(), y))
 
         dx = x - self.start_x
         dy = y - self.start_y
@@ -329,12 +449,12 @@ class KittyTouchScroll:
         if now - self.last_emit < EMIT_INTERVAL:
             return
 
-        ticks = math.trunc(self.accum_y / WHEEL_STEP_PX)
+        ticks = math.trunc(self.accum_y / LINE_PX)
         if not ticks:
             return
 
         ticks = max(-MAX_TICKS_PER_EMIT, min(MAX_TICKS_PER_EMIT, ticks))
-        self.accum_y -= ticks * WHEEL_STEP_PX
+        self.accum_y -= ticks * LINE_PX
 
         # Natural direct-touch direction:
         # finger up -> negative wheel -> reveal content below;
@@ -346,7 +466,7 @@ class KittyTouchScroll:
     def watch(self, device: str) -> None:
         self.slot = 0
         self.slots.clear()
-        self.finish()
+        self.finish(momentum=False)
 
         with open(device, "rb", buffering=0) as stream:
             try:
