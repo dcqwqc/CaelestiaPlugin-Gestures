@@ -7,52 +7,39 @@ import Quickshell.Io
 Singleton {
     id: root
 
-    readonly property string bin: `${Quickshell.env("HOME")}/.local/bin/mirai-gestures`
-    property bool available: false
-    property bool active: false
-    property bool busy: action.running || statusProc.running
+    readonly property string bin: `${Quickshell.env("HOME")}/.local/share/caelestia/plugins/gestures/daemon/mirai_gestures.py`
+    property bool desiredActive: true
+    readonly property bool available: true
+    readonly property bool active: daemon.running
+    readonly property bool busy: false
 
-    function refresh(): void {
-        if (!busy)
-            statusProc.running = true;
+    function ensureStarted(): void {
+        desiredActive = true;
     }
 
     function toggle(): void {
-        if (busy)
-            return;
-        action.command = [bin, "toggle"];
-        action.running = true;
+        desiredActive = !desiredActive;
     }
 
     Process {
-        id: statusProc
-        command: [root.bin, "status-json"]
-        running: false
-        stdout: StdioCollector {
-            onStreamFinished: {
-                try {
-                    const value = JSON.parse(text);
-                    root.available = !!value.available;
-                    root.active = !!value.active;
-                } catch (e) {
-                    root.available = false;
-                    root.active = false;
-                }
-            }
+        id: daemon
+        command: [root.bin, "daemon"]
+        running: root.desiredActive
+        onExited: code => {
+            if (root.desiredActive)
+                restartTimer.restart();
         }
     }
 
-    Process {
-        id: action
-        running: false
-        onExited: code => root.refresh()
-    }
-
     Timer {
-        interval: 3000
-        running: true
-        repeat: true
-        triggeredOnStart: true
-        onTriggered: root.refresh()
+        id: restartTimer
+        interval: 1200
+        repeat: false
+        onTriggered: {
+            if (root.desiredActive && !daemon.running) {
+                root.desiredActive = false;
+                root.desiredActive = true;
+            }
+        }
     }
 }

@@ -41,8 +41,12 @@ TOUCHPAD_HYPR_NAME = "elan06fa:00-04f3:327e-touchpad"
 TOUCHSCREEN_NAME = "wacom hid 53b7 finger"
 TOUCHSCREEN_HYPR_NAME = "wacom-hid-53b7-finger"
 TOUCHSCREEN_OUTPUT = "eDP-1"
-REMOTE = str(Path.home() / ".local/bin/kagami-remote")
-UINPUT_MOUSE = str(Path.home() / ".local/libexec/mirai-uinput-mouse")
+REMOTE_PLUGIN = Path.home() / ".local/share/caelestia/plugins/remote-desktop/scripts/remote-desktop"
+REMOTE_LEGACY = Path.home() / ".local/bin/kagami-remote"
+REMOTE = str(REMOTE_PLUGIN if REMOTE_PLUGIN.exists() else REMOTE_LEGACY)
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "caelestia-plugin-gestures"
+UINPUT_MOUSE = str(CACHE_DIR / "mirai-uinput-mouse")
 
 TAP_MAX_SECONDS = 0.50
 TAP_MAX_MOVE = 180.0
@@ -129,6 +133,20 @@ _touch_mouse_lock = threading.Lock()
 def ensure_touch_mouse() -> subprocess.Popen[str] | None:
     global _touch_mouse_proc
     with _touch_mouse_lock:
+        binary = Path(UINPUT_MOUSE)
+        if not binary.exists():
+            try:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                compiler = os.environ.get("CC", "cc")
+                source = PLUGIN_ROOT / "native" / "uinput_mouse.c"
+                subprocess.run(
+                    [compiler, "-O2", "-Wall", "-Wextra", "-std=c11", str(source), "-o", str(binary)],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+                )
+                binary.chmod(0o755)
+            except (OSError, subprocess.SubprocessError) as e:
+                log(f"uinput mouse build failed: {e}")
+                return None
         if _touch_mouse_proc is not None and _touch_mouse_proc.poll() is None:
             return _touch_mouse_proc
         try:
