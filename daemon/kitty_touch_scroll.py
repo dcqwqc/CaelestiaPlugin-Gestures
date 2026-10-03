@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Passive one-finger touchscreen scrolling for Kitty on Mirai.
+"""Passive one-finger touchscreen scrolling for Kitty on Hyprland.
 
 This daemon NEVER grabs or disables the touchscreen. Hyprland continues to own
 native touch normally. When the focused window is Kitty and a single direct
@@ -30,8 +30,8 @@ ABS_MT_POSITION_X = 0x35
 ABS_MT_POSITION_Y = 0x36
 ABS_MT_TRACKING_ID = 0x39
 
-TOUCHSCREEN_NAME = "wacom hid 53b7 finger"
-TOUCHSCREEN_OUTPUT = "eDP-1"
+TOUCHSCREEN_NAME_OVERRIDE = os.environ.get("CAELESTIA_GESTURES_TOUCHSCREEN", "").strip().lower()
+TOUCHSCREEN_OUTPUT_OVERRIDE = os.environ.get("CAELESTIA_GESTURES_TOUCHSCREEN_OUTPUT", "").strip()
 
 # Direct-manipulation tuning in logical compositor pixels.
 #
@@ -71,8 +71,39 @@ def find_device() -> str | None:
             name = name_file.read_text(errors="replace").strip().lower()
         except OSError:
             continue
-        if TOUCHSCREEN_NAME in name:
+        if TOUCHSCREEN_NAME_OVERRIDE:
+            if TOUCHSCREEN_NAME_OVERRIDE in name:
+                return dev
+            continue
+        try:
+            proc = subprocess.run(
+                ["udevadm", "info", "--query=property", "--name", dev],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=0.35, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if "ID_INPUT_TOUCHSCREEN=1" in set((proc.stdout or "").splitlines()):
             return dev
+    return None
+
+
+def touchscreen_output(monitors: list[dict]) -> str | None:
+    if TOUCHSCREEN_OUTPUT_OVERRIDE:
+        return TOUCHSCREEN_OUTPUT_OVERRIDE
+    devices = run_json("devices", "-j")
+    if isinstance(devices, dict):
+        for dev in devices.get("touch", []):
+            output = str(dev.get("output") or "").strip()
+            if output:
+                return output
+    for mon in monitors:
+        name = str(mon.get("name") or "")
+        if name.lower().startswith(("edp", "lvds", "dsi")):
+            return name
+    if monitors:
+        focused = next((m for m in monitors if m.get("focused")), monitors[0])
+        return str(focused.get("name") or "") or None
     return None
 
 
@@ -138,10 +169,10 @@ class DesktopState:
         if now - self.last_monitor_poll >= MONITOR_POLL_INTERVAL:
             monitors = run_json("monitors", "-j")
             if isinstance(monitors, list):
-                monitor = next(
-                    (m for m in monitors if m.get("name") == TOUCHSCREEN_OUTPUT),
-                    None,
-                )
+                output = touchscreen_output(monitors)
+                monitor = next((m for m in monitors if m.get("name") == output), None)
+                if monitor is None and monitors:
+                    monitor = next((m for m in monitors if m.get("focused")), monitors[0])
             self.last_monitor_poll = now
 
         with self.lock:

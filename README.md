@@ -1,55 +1,16 @@
-# Caelestia Gestures / Mirai Gestures
+# Caelestia Gestures
 
-Mirai-specific touchpad and direct-touch gesture integration for Hyprland/Caelestia.
+Hardware-discovered touchpad and touchscreen gesture integration for Hyprland and Caelestia.
 
-- Two-finger pinch in **Aseprite** -> smooth canvas zoom (touchpad + touchscreen)
-- Three-finger tap -> `Ctrl+Z` (Undo)
-- Four-finger tap -> `Ctrl+Y` (Redo)
-- Existing four-finger touchpad swipe -> Kagami Remote toggle
-- One-finger tap, two-finger right-click and tap-drag are preserved after native touchpad tap-to-click is disabled to prevent the 3-finger middle-click collision.
+The daemon discovers touchpads and touchscreens through udev capability tags rather than laptop-specific model names. The touchscreen output is taken from Hyprland when available and otherwise falls back to the internal panel or focused monitor.
 
-The daemon reads the physical multitouch event streams without grabbing them, so two-finger scrolling, cursor movement, touchscreen interaction, and pen input stay native.
+Optional environment overrides are available for unusual hardware:
 
-## Mirai installation
+- CAELESTIA_GESTURES_TOUCHPAD
+- CAELESTIA_GESTURES_TOUCHPAD_HYPR
+- CAELESTIA_GESTURES_TOUCHSCREEN
+- CAELESTIA_GESTURES_TOUCHSCREEN_OUTPUT
 
-`install.sh` deploys the daemon/service, disables the superseded four-finger-only service, and symlinks the Caelestia plugin into the plugin directory.
+Features include app-aware multi-touch handling, Aseprite pinch/pan support, terminal direct-touch scrolling with momentum, gesture Undo/Redo, and optional Remote Desktop swipe integration.
 
-
-## Aseprite direct-touch mode
-
-On Mirai, Aseprite 1.3.x runs through XWayland and does not expose the native
-finger gesture layer available on Windows/macOS. While Aseprite is focused the
-service temporarily disables only Hyprland's `wacom-hid-53b7-finger` device and
-reads that kernel event stream directly:
-
-- one finger drag on the touchscreen -> canvas pan
-- two fingers moving together -> canvas pan, horizontally and vertically
-- genuine two-finger pinch/spread -> zoom
-- three-finger tap -> Ctrl+Z
-- four-finger tap -> Ctrl+Y
-
-The two-finger recognizer is geometry-based and shared by touchpad + touchscreen.
-It compares normalized centroid translation with normalized finger-separation
-change, then locks the gesture to PAN or ZOOM until lift-off. Native touchpad
-scrolling is temporarily set to zero only while Aseprite is focused so a
-two-finger pan cannot leak through as Aseprite wheel-zoom.
-
-The Wacom pen/stylus is a separate device and is never disabled. When focus
-leaves Aseprite, native Hyprland touchscreen handling is restored automatically.
-
-
-### Gesture feel / latency
-
-- Pinch zoom gain is intentionally reduced to about 40% of the original value
-  and is capped to one wheel notch per update.
-- Direct touchscreen panning grabs immediately on first contact instead of
-  waiting for a movement threshold.
-- High-frequency cursor movement and active-window checks use Hyprland's Unix
-  IPC socket directly instead of spawning hyprctl for every frame.
-- Middle-button press/release is synchronous so Aseprite always sees the grab
-  before the first cursor movement.
-
-
-- Touchscreen two-finger PAN keeps the synthetic middle-button hold alive across
-  successive multi-touch frames; the one-finger cleanup path must not release
-  a gesture after the two-finger classifier has locked to PAN.
+Legacy filenames such as mirai_gestures.py and mirai-gestures.service are retained only as compatibility entry points for existing installations; runtime device discovery is hardware-agnostic.
