@@ -24,6 +24,7 @@ EVENT = struct.Struct("llHHi")
 EV_SYN = 0x00
 EV_KEY = 0x01
 EV_ABS = 0x03
+BTN_LEFT = 0x110
 SYN_REPORT = 0
 ABS_MT_SLOT = 0x2F
 ABS_MT_POSITION_X = 0x35
@@ -40,6 +41,8 @@ REMOTE_LEGACY = Path.home() / ".local/bin/kagami-remote"
 REMOTE = str(REMOTE_PLUGIN if REMOTE_PLUGIN.exists() else REMOTE_LEGACY)
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "caelestia-plugin-gestures"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "caelestia-plugin-gestures"
+CONFIG_PATH = CONFIG_DIR / "settings.json"
 UINPUT_MOUSE = str(CACHE_DIR / "gesture-uinput-mouse")
 
 TAP_MAX_SECONDS = 0.50
@@ -61,6 +64,8 @@ TOUCH_DECISION_SECONDS = 0.45  # unresolved gesture defaults to PAN
 TOUCH_DRAW_DELAY = 0.065         # allow a second finger to join without painting a dot
 PINCH_TICKS_PER_LOG = 12.0    # gentler: one wheel notch per ~8.7% scale change
 PINCH_TICK_LIMIT = 1          # avoid bursty jumps from one frame
+DOUBLE_CLICK_SECONDS = 0.38    # standard-feeling double-click window
+DOUBLE_CLICK_MAX_DISTANCE = 32.0
 
 
 def log(message: str) -> None:
@@ -299,6 +304,169 @@ def hypr_request(message: str, timeout: float = 0.08) -> str:
             return b"".join(chunks).decode(errors="replace")
     except OSError:
         return ""
+
+
+_double_click_lock = threading.Lock()
+_last_primary_click: tuple[float, float, float, str, str] | None = None
+
+
+def read_runtime_settings() -> dict[str, object]:
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def double_click_fullscreen_enabled() -> bool:
+    return bool(read_runtime_settings().get("doubleClickFullscreen", True))
+
+
+def write_double_click_fullscreen(enabled: bool) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    data = read_runtime_settings()
+    data["doubleClickFullscreen"] = bool(enabled)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, CONFIG_PATH)
+
+
+def active_click_context() -> tuple[float, float, str] | None:
+    try:
+        pos = json.loads(hypr_request("j/cursorpos", timeout=0.05) or "{}")
+        win = json.loads(hypr_request("j/activewindow", timeout=0.05) or "{}")
+        address = str(win.get("address") or "")
+        if not address or address == "0x0" or not win.get("mapped", True):
+            return None
+        return float(pos["x"]), float(pos["y"]), address
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def toggle_fullscreen_if_still_active(address: str) -> None:
+    try:
+        win = json.loads(hypr_request("j/activewindow", timeout=0.05) or "{}")
+    except json.JSONDecodeError:
+        return
+    if str(win.get("address") or "") != address:
+        return
+    result = hypr_request("dispatch fullscreen 0 toggle", timeout=0.20).strip()
+    log(f"double-click -> fullscreen toggle address={address} result={result!r}")
+
+
+def note_primary_click(source: str) -> None:
+    global _last_primary_click
+    if not double_click_fullscreen_enabled():
+        with _double_click_lock:
+            _last_primary_click = None
+        return
+
+    context = active_click_context()
+    if context is None:
+        return
+    x, y, address = context
+    now = time.monotonic()
+    fire = False
+    with _double_click_lock:
+        previous = _last_primary_click
+        if previous is not None:
+            prev_time, prev_x, prev_y, prev_address, prev_source = previous
+            dt = now - prev_time
+            distance = math.hypot(x - prev_x, y - prev_y)
+            same_window = address == prev_address
+            nearby = distance <= DOUBLE_CLICK_MAX_DISTANCE
+            cross_source_duplicate = (
+                dt <= 0.30
+                and same_window
+                and nearby
+                and (
+                    (prev_source.startswith("pointer:") and source == "touchpad-tap")
+                    or (prev_source == "touchpad-tap" and source.startswith("pointer:"))
+                )
+            )
+            if cross_source_duplicate:
+                log(f"double-click duplicate suppressed sources={prev_source},{source}")
+                return
+            if dt <= DOUBLE_CLICK_SECONDS and same_window and nearby:
+                _last_primary_click = None
+                fire = True
+            else:
+                _last_primary_click = (now, x, y, address, source)
+        else:
+            _last_primary_click = (now, x, y, address, source)
+    if fire:
+        log(f"double-click detected source={source} address={address}")
+        toggle_fullscreen_if_still_active(address)
+
+
+def defer_primary_click(source: str, delay: float = 0.045) -> None:
+    timer = threading.Timer(delay, note_primary_click, args=(source,))
+    timer.daemon = True
+    timer.start()
+
+
+def pointer_button_devices() -> list[str]:
+    found: set[str] = set()
+    candidates: set[str] = set()
+    for pattern in ("/dev/input/by-path/*-event-mouse", "/dev/input/by-id/*-event-mouse"):
+        for link in glob.glob(pattern):
+            real = os.path.realpath(link)
+            if os.path.exists(real):
+                candidates.add(real)
+
+    for dev in sorted(candidates):
+        name = input_device_name(dev).lower()
+        if any(token in name for token in ("caelestia gesture", "ydotool", "virtual", "pen")):
+            continue
+        try:
+            info = subprocess.run(
+                ["udevadm", "info", "--query=property", "--name", dev],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=0.35,
+                check=False,
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if "ID_INPUT_MOUSE=1" in (info or "").splitlines():
+            found.add(dev)
+    return sorted(found)
+
+
+def watch_primary_button(device: str) -> None:
+    name = input_device_name(device) or os.path.basename(device)
+    while True:
+        try:
+            with open(device, "rb", buffering=0) as f:
+                log(f"double-click watching {device} ({name})")
+                while True:
+                    data = f.read(EVENT.size)
+                    if len(data) != EVENT.size:
+                        raise OSError("pointer input stream ended")
+                    _sec, _usec, ev_type, code, value = EVENT.unpack(data)
+                    if ev_type == EV_KEY and code == BTN_LEFT and value == 0:
+                        note_primary_click(f"pointer:{name}")
+        except (OSError, PermissionError):
+            time.sleep(1.0)
+
+
+def primary_button_manager() -> None:
+    workers: dict[str, threading.Thread] = {}
+    while True:
+        for device in pointer_button_devices():
+            thread = workers.get(device)
+            if thread is None or not thread.is_alive():
+                thread = threading.Thread(
+                    target=watch_primary_button,
+                    args=(device,),
+                    daemon=True,
+                    name=f"gesture-pointer-{os.path.basename(device)}",
+                )
+                workers[device] = thread
+                thread.start()
+        time.sleep(2.0)
 
 
 def move_cursor(x: int, y: int) -> None:
@@ -977,6 +1145,7 @@ class MTWatcher:
         if is_tap:
             if self.kind == "touchpad" and fingers == 1:
                 mouse_click("left")
+                defer_primary_click("touchpad-tap")
                 log("touchpad tap1 -> left click")
                 self.last_single_tap = now
             elif self.kind == "touchpad" and fingers == 2:
@@ -1185,7 +1354,11 @@ def service_active() -> bool:
 
 def control(action: str) -> int:
     if action == "status-json":
-        print(json.dumps({"available": True, "active": service_active()}))
+        print(json.dumps({
+            "available": True,
+            "active": service_active(),
+            "doubleClickFullscreen": double_click_fullscreen_enabled(),
+        }))
         return 0
     if action == "toggle":
         action = "stop" if service_active() else "start"
@@ -1215,6 +1388,13 @@ def daemon() -> None:
         name="gesture-keyboard-manager",
     )
     keyboard_manager.start()
+
+    pointer_manager = threading.Thread(
+        target=primary_button_manager,
+        daemon=True,
+        name="gesture-pointer-manager",
+    )
+    pointer_manager.start()
 
     ensure_touch_mouse()
     time.sleep(0.08)
@@ -1259,10 +1439,21 @@ def daemon() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", nargs="?", default="daemon", choices=["daemon", "status-json", "toggle", "start", "stop", "restart"])
+    ap.add_argument(
+        "command", nargs="?", default="daemon",
+        choices=["daemon", "status-json", "set-double-click-fullscreen", "toggle", "start", "stop", "restart"],
+    )
+    ap.add_argument("value", nargs="?")
     ns = ap.parse_args()
     if ns.command == "daemon":
         daemon(); return 0
+    if ns.command == "set-double-click-fullscreen":
+        if ns.value not in ("0", "1", "false", "true", "off", "on"):
+            ap.error("set-double-click-fullscreen requires 0/1, false/true, or off/on")
+        enabled = ns.value in ("1", "true", "on")
+        write_double_click_fullscreen(enabled)
+        print(json.dumps({"doubleClickFullscreen": enabled}))
+        return 0
     return control(ns.command)
 
 
