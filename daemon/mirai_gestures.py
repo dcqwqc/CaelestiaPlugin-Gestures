@@ -48,6 +48,7 @@ UINPUT_MOUSE = str(CACHE_DIR / "gesture-uinput-mouse")
 
 TAP_MAX_SECONDS = 0.50
 TAP_MAX_MOVE = 180.0
+TOUCH_TAP_MAX_MOVE = 1000.0  # about 48 px on Mirai; tolerant of fingertip jitter
 DRAG_ARM_SECONDS = 0.38
 DRAG_START_MOVE = 70.0
 KEYBOARD_QUIET_SECONDS = 0.60  # palm/touchpad guard after any physical key press
@@ -67,6 +68,8 @@ PINCH_TICKS_PER_LOG = 12.0    # gentler: one wheel notch per ~8.7% scale change
 PINCH_TICK_LIMIT = 1          # avoid bursty jumps from one frame
 DOUBLE_CLICK_SECONDS = 0.38    # standard-feeling double-click window
 DOUBLE_CLICK_MAX_DISTANCE = 32.0
+DOUBLE_TAP_SECONDS = 0.48
+DOUBLE_TAP_MAX_DISTANCE = 64.0
 
 
 def log(message: str) -> None:
@@ -309,6 +312,8 @@ def hypr_request(message: str, timeout: float = 0.08) -> str:
 
 _double_click_lock = threading.Lock()
 _last_primary_click: tuple[float, float, float, str, str] | None = None
+_touchscreen_tap_lock = threading.Lock()
+_last_touchscreen_tap: tuple[float, float, float, str] | None = None
 
 
 def read_runtime_settings() -> dict[str, object]:
@@ -417,6 +422,55 @@ def note_primary_click(source: str) -> None:
 
 def defer_primary_click(source: str, delay: float = 0.045) -> None:
     timer = threading.Timer(delay, note_primary_click, args=(source,))
+    timer.daemon = True
+    timer.start()
+
+
+def note_touchscreen_tap(x: float, y: float) -> None:
+    global _last_touchscreen_tap
+    if not double_click_fullscreen_enabled():
+        with _touchscreen_tap_lock:
+            _last_touchscreen_tap = None
+        return
+
+    try:
+        win = json.loads(hypr_request("j/activewindow", timeout=0.05) or "{}")
+    except json.JSONDecodeError:
+        return
+    address = str(win.get("address") or "")
+    if not address or address == "0x0" or not win.get("mapped", True):
+        return
+
+    now = time.monotonic()
+    fire = False
+    with _touchscreen_tap_lock:
+        previous = _last_touchscreen_tap
+        if previous is not None:
+            prev_time, prev_x, prev_y, prev_address = previous
+            dt = now - prev_time
+            distance = math.hypot(x - prev_x, y - prev_y)
+            if (
+                dt <= DOUBLE_TAP_SECONDS
+                and distance <= DOUBLE_TAP_MAX_DISTANCE
+                and address == prev_address
+            ):
+                _last_touchscreen_tap = None
+                fire = True
+            else:
+                _last_touchscreen_tap = (now, x, y, address)
+        else:
+            _last_touchscreen_tap = (now, x, y, address)
+
+    if fire:
+        log(f"touchscreen double-tap detected address={address} x={x:.0f} y={y:.0f}")
+        toggle_fullscreen_if_still_active(address)
+
+
+def defer_touchscreen_tap(x: float, y: float, delay: float = 0.055) -> None:
+    # Direct touch is delivered to the client/compositor normally. Wait a tiny
+    # amount so a tap that focuses another window has updated activewindow
+    # before we associate the tap with that window.
+    timer = threading.Timer(delay, note_touchscreen_tap, args=(x, y))
     timer.daemon = True
     timer.start()
 
@@ -940,8 +994,11 @@ class MTWatcher:
         self.start_centroid = centroid
         self.max_move = 0.0
         self.drag_candidate = self.kind == "touchpad" and len(active) == 1 and now - self.last_single_tap <= DRAG_ARM_SECONDS
-        if self.kind == "touchscreen" and len(active) == 1 and centroid is not None and aseprite_active():
+        if self.kind == "touchscreen":
+            # Refresh this for every contact sequence so double-tap positions
+            # follow screen rotation/output geometry even outside Aseprite.
             self.touch_geometry = touchscreen_logical_geometry()
+        if self.kind == "touchscreen" and len(active) == 1 and centroid is not None and aseprite_active():
             cx, cy = self.touch_to_cursor(round(centroid[0]), round(centroid[1]))
             move_cursor(cx, cy)
             self.draw_pending = True
@@ -1131,8 +1188,12 @@ class MTWatcher:
             return
         if self.kind == "touchscreen" and self.draw_pending and self.max_fingers == 1:
             # A very quick touch (< draw delay) should still behave like a
-            # normal mouse click / pencil dot.
+            # normal mouse click / pencil dot. It can also be one half of the
+            # global double-tap fullscreen gesture.
             touch_mouse_left_click()
+            if self.start_centroid is not None:
+                tx, ty = self.touch_to_cursor(round(self.start_centroid[0]), round(self.start_centroid[1]))
+                defer_touchscreen_tap(tx, ty)
             log("touchscreen one-finger -> click")
             self.draw_pending = False
             self.last_single_tap = -999.0
@@ -1149,9 +1210,10 @@ class MTWatcher:
             self.reset_session()
             return
 
+        tap_move_limit = TOUCH_TAP_MAX_MOVE if self.kind == "touchscreen" else TAP_MAX_MOVE
         is_tap = (
             duration <= TAP_MAX_SECONDS
-            and self.max_move <= TAP_MAX_MOVE
+            and self.max_move <= tap_move_limit
             and not self.pinch_active
             and not self.remote_fired
         )
@@ -1167,6 +1229,11 @@ class MTWatcher:
             elif self.kind == "touchpad" and fingers == 2:
                 mouse_click("right")
                 log("touchpad tap2 -> right click")
+                self.last_single_tap = -999.0
+            elif self.kind == "touchscreen" and fingers == 1 and self.start_centroid is not None:
+                tx, ty = self.touch_to_cursor(round(self.start_centroid[0]), round(self.start_centroid[1]))
+                defer_touchscreen_tap(tx, ty)
+                log(f"touchscreen tap1 -> double-tap candidate x={tx} y={ty}")
                 self.last_single_tap = -999.0
             elif fingers == 3:
                 hypr_shortcut("z")
@@ -1244,6 +1311,11 @@ class MTWatcher:
                 self.two_settled = False
                 self.pinch_active = False
                 self.pinch_accum = 0.0
+
+        if self.start_centroid is None and c is not None:
+            # Some touch devices report TRACKING_ID one frame before position.
+            # Capture the first real coordinate instead of losing tap detection.
+            self.start_centroid = c
 
         if c is not None and self.start_centroid is not None and len(active) == self.max_fingers:
             move = math.hypot(c[0] - self.start_centroid[0], c[1] - self.start_centroid[1])
