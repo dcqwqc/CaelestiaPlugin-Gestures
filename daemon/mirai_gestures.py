@@ -39,6 +39,7 @@ TOUCHSCREEN_OUTPUT_OVERRIDE = os.environ.get("CAELESTIA_GESTURES_TOUCHSCREEN_OUT
 REMOTE_PLUGIN = Path.home() / ".local/share/caelestia/plugins/remote-desktop/scripts/remote-desktop"
 REMOTE_LEGACY = Path.home() / ".local/bin/kagami-remote"
 REMOTE = str(REMOTE_PLUGIN if REMOTE_PLUGIN.exists() else REMOTE_LEGACY)
+YOGA_TABLET = str(Path.home() / ".local/bin/yoga-tablet")
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "caelestia-plugin-gestures"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "caelestia-plugin-gestures"
@@ -350,8 +351,23 @@ def toggle_fullscreen_if_still_active(address: str) -> None:
         return
     if str(win.get("address") or "") != address:
         return
-    result = hypr_request("dispatch fullscreen 0 toggle", timeout=0.20).strip()
-    log(f"double-click -> fullscreen toggle address={address} result={result!r}")
+
+    # SUPER+F on Mirai intentionally goes through yoga-tablet rather than the
+    # raw Hyprland fullscreen dispatcher. That helper preserves the exact
+    # fullscreenClient/internal state and the tablet keyboard fitted-fullscreen
+    # behavior. Keep the double-click gesture semantically identical to SUPER+F.
+    try:
+        p = subprocess.run(
+            [YOGA_TABLET, "fullscreen"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.0,
+            check=False,
+        )
+        log(f"double-click -> SUPER+F equivalent address={address} rc={p.returncode}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"double-click fullscreen failed address={address}: {exc}")
 
 
 def note_primary_click(source: str) -> None:
