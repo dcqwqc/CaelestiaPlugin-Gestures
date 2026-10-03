@@ -1,5 +1,5 @@
 [Unit]
-Description=Mirai multi-touch gesture bridge
+Description=Caelestia multi-touch gesture bridge
 After=graphical-session.target ydotool.service
 PartOf=graphical-session.target
 

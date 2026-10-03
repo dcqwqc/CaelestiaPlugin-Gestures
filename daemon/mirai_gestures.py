@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""Mirai's low-level touchpad/touchscreen gesture bridge.
+"""Low-level touchpad/touchscreen gesture bridge for Hyprland.
 
-Design constraints:
-- native touchscreen input stays completely untouched outside Aseprite
-- while Aseprite is focused, EVIOCGRAB gives the daemon exclusive ownership
-  of only the touchscreen event node; releasing the grab restores native touch
-- touchpad taps are re-emitted because native tap_to_click is disabled on Mirai
-  so 3-finger tap can mean Undo without also producing a middle click
-- preserve the existing four-finger Remote Desktop swipe
-- only synthesize pinch-wheel events while Aseprite is focused
+Input devices are discovered through udev capability tags rather than model
+names. Optional environment overrides remain available for unusual hardware.
 """
 from __future__ import annotations
 
@@ -28,6 +22,7 @@ import time
 
 EVENT = struct.Struct("llHHi")
 EV_SYN = 0x00
+EV_KEY = 0x01
 EV_ABS = 0x03
 SYN_REPORT = 0
 ABS_MT_SLOT = 0x2F
@@ -36,22 +31,22 @@ ABS_MT_POSITION_Y = 0x36
 ABS_MT_TRACKING_ID = 0x39
 EVIOCGRAB = 0x40044590
 
-TOUCHPAD_NAME = "elan06fa:00 04f3:327e touchpad"
-TOUCHPAD_HYPR_NAME = "elan06fa:00-04f3:327e-touchpad"
-TOUCHSCREEN_NAME = "wacom hid 53b7 finger"
-TOUCHSCREEN_HYPR_NAME = "wacom-hid-53b7-finger"
-TOUCHSCREEN_OUTPUT = "eDP-1"
+TOUCHPAD_NAME_OVERRIDE = os.environ.get("CAELESTIA_GESTURES_TOUCHPAD", "").strip().lower()
+TOUCHPAD_HYPR_OVERRIDE = os.environ.get("CAELESTIA_GESTURES_TOUCHPAD_HYPR", "").strip()
+TOUCHSCREEN_NAME_OVERRIDE = os.environ.get("CAELESTIA_GESTURES_TOUCHSCREEN", "").strip().lower()
+TOUCHSCREEN_OUTPUT_OVERRIDE = os.environ.get("CAELESTIA_GESTURES_TOUCHSCREEN_OUTPUT", "").strip()
 REMOTE_PLUGIN = Path.home() / ".local/share/caelestia/plugins/remote-desktop/scripts/remote-desktop"
 REMOTE_LEGACY = Path.home() / ".local/bin/kagami-remote"
 REMOTE = str(REMOTE_PLUGIN if REMOTE_PLUGIN.exists() else REMOTE_LEGACY)
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "caelestia-plugin-gestures"
-UINPUT_MOUSE = str(CACHE_DIR / "mirai-uinput-mouse")
+UINPUT_MOUSE = str(CACHE_DIR / "gesture-uinput-mouse")
 
 TAP_MAX_SECONDS = 0.50
 TAP_MAX_MOVE = 180.0
 DRAG_ARM_SECONDS = 0.38
 DRAG_START_MOVE = 70.0
+KEYBOARD_QUIET_SECONDS = 0.60  # palm/touchpad guard after any physical key press
 REMOTE_SWIPE_DISTANCE = 500.0
 REMOTE_COOLDOWN = 0.85
 TWO_PAN_START = 0.008        # normalized centroid travel (~0.8% of pad/screen)
@@ -69,7 +64,78 @@ PINCH_TICK_LIMIT = 1          # avoid bursty jumps from one frame
 
 
 def log(message: str) -> None:
-    print(f"[mirai-gestures] {time.monotonic():.3f} {message}", flush=True)
+    print(f"[gestures] {time.monotonic():.3f} {message}", flush=True)
+
+
+_keyboard_lock = threading.Lock()
+_keyboard_last_activity = -999.0
+
+
+def mark_keyboard_activity() -> None:
+    global _keyboard_last_activity
+    with _keyboard_lock:
+        _keyboard_last_activity = time.monotonic()
+
+
+def keyboard_guard_active() -> bool:
+    with _keyboard_lock:
+        return time.monotonic() - _keyboard_last_activity < KEYBOARD_QUIET_SECONDS
+
+
+def keyboard_event_devices() -> list[str]:
+    """Return physical keyboard evdev nodes, deduplicated across by-path/by-id."""
+    found: set[str] = set()
+    for pattern in ("/dev/input/by-path/*-event-kbd", "/dev/input/by-id/*-event-kbd"):
+        for link in glob.glob(pattern):
+            real = os.path.realpath(link)
+            if os.path.exists(real):
+                found.add(real)
+
+    # Laptop fallback when udev symlinks are unavailable.
+    if not found:
+        for dev in sorted(glob.glob("/dev/input/event*")):
+            event = os.path.basename(dev)
+            name_file = Path("/sys/class/input") / event / "device/name"
+            try:
+                name = name_file.read_text(errors="replace").strip().lower()
+            except OSError:
+                continue
+            if "keyboard" in name and "virtual" not in name:
+                found.add(dev)
+    return sorted(found)
+
+
+def watch_keyboard(device: str) -> None:
+    while True:
+        try:
+            with open(device, "rb", buffering=0) as f:
+                log(f"keyboard guard watching {device}")
+                while True:
+                    data = f.read(EVENT.size)
+                    if len(data) != EVENT.size:
+                        raise OSError("keyboard input stream ended")
+                    _sec, _usec, ev_type, _code, value = EVENT.unpack(data)
+                    if ev_type == EV_KEY and value in (1, 2):  # press or autorepeat
+                        mark_keyboard_activity()
+        except (OSError, PermissionError):
+            time.sleep(1.0)
+
+
+def keyboard_guard_manager() -> None:
+    workers: dict[str, threading.Thread] = {}
+    while True:
+        for device in keyboard_event_devices():
+            thread = workers.get(device)
+            if thread is None or not thread.is_alive():
+                thread = threading.Thread(
+                    target=watch_keyboard,
+                    args=(device,),
+                    daemon=True,
+                    name=f"gesture-keyboard-{os.path.basename(device)}",
+                )
+                workers[device] = thread
+                thread.start()
+        time.sleep(2.0)
 
 
 def quiet_popen(argv: list[str]) -> None:
@@ -332,11 +398,72 @@ def hypr_eval(expr: str, label: str) -> bool:
     return True
 
 
+def normalise_hypr_device_name(name: str) -> str:
+    import re
+    value = name.strip().lower()
+    value = re.sub(r"[^a-z0-9:_-]+", "-", value)
+    return value.strip("-")
+
+
+def input_device_name(device: str) -> str:
+    event = os.path.basename(device)
+    try:
+        return (Path("/sys/class/input") / event / "device/name").read_text(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def udev_input_kind(device: str) -> str | None:
+    try:
+        p = subprocess.run(
+            ["udevadm", "info", "--query=property", "--name", device],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=0.35, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    props = set((p.stdout or "").splitlines())
+    if "ID_INPUT_TOUCHPAD=1" in props:
+        return "touchpad"
+    if "ID_INPUT_TOUCHSCREEN=1" in props:
+        return "touchscreen"
+    return None
+
+
+def find_input_device(kind: str, name_override: str = "") -> str | None:
+    candidates = []
+    for dev in sorted(glob.glob("/dev/input/event*")):
+        name = input_device_name(dev).lower()
+        if name_override:
+            if name_override in name:
+                return dev
+            continue
+        if udev_input_kind(dev) == kind:
+            candidates.append(dev)
+    return candidates[0] if candidates else None
+
+
+def hypr_touchpad_name() -> str | None:
+    if TOUCHPAD_HYPR_OVERRIDE:
+        return TOUCHPAD_HYPR_OVERRIDE
+    try:
+        data = json.loads(hypr_request("j/devices", timeout=0.10) or "{}")
+        for dev in data.get("mice", []):
+            name = str(dev.get("name") or "")
+            if "touchpad" in name.lower() and "virtual" not in name.lower():
+                return name
+    except (ValueError, json.JSONDecodeError):
+        pass
+    raw = find_input_device("touchpad", TOUCHPAD_NAME_OVERRIDE)
+    return normalise_hypr_device_name(input_device_name(raw)) if raw else None
+
+
 def set_touchpad_scroll_factor(value: float) -> bool:
-    expr = (
-        'hl.device({ name = "' + TOUCHPAD_HYPR_NAME +
-        '", scroll_factor = ' + f"{value:g}" + ' })'
-    )
+    name = hypr_touchpad_name()
+    if not name:
+        log("touchpad scroll_factor skipped: no touchpad discovered")
+        return False
+    expr = 'hl.device({ name = "' + name + '", scroll_factor = ' + f"{value:g}" + ' })'
     return hypr_eval(expr, f"touchpad scroll_factor={value:g}")
 
 
@@ -379,22 +506,48 @@ def touch_policy_loop(touchscreen: "MTWatcher") -> None:
         time.sleep(0.04)
 
 
-def touchscreen_logical_geometry() -> tuple[int, int, int, int, int]:
-    """Return x, y, logical width, logical height, transform for eDP-1."""
+def touchscreen_output_name() -> str | None:
+    if TOUCHSCREEN_OUTPUT_OVERRIDE:
+        return TOUCHSCREEN_OUTPUT_OVERRIDE
     try:
-        for mon in json.loads(hypr_request("j/monitors", timeout=0.08) or "[]"):
-            if mon.get("name") == TOUCHSCREEN_OUTPUT:
-                scale = float(mon.get("scale") or 1.0)
-                return (
-                    int(mon.get("x") or 0),
-                    int(mon.get("y") or 0),
-                    max(1, round(float(mon.get("width") or 1) / scale)),
-                    max(1, round(float(mon.get("height") or 1) / scale)),
-                    int(mon.get("transform") or 0),
-                )
+        devices = json.loads(hypr_request("j/devices", timeout=0.10) or "{}")
+        for dev in devices.get("touch", []):
+            output = str(dev.get("output") or "").strip()
+            if output:
+                return output
+        monitors = json.loads(hypr_request("j/monitors", timeout=0.10) or "[]")
+        for mon in monitors:
+            name = str(mon.get("name") or "")
+            if name.lower().startswith(("edp", "lvds", "dsi")):
+                return name
+        if monitors:
+            focused = next((m for m in monitors if m.get("focused")), monitors[0])
+            return str(focused.get("name") or "") or None
     except (ValueError, json.JSONDecodeError):
         pass
-    return (0, 0, 1440, 900, 0)
+    return None
+
+
+def touchscreen_logical_geometry() -> tuple[int, int, int, int, int]:
+    """Return x, y, logical width, logical height and transform for the touch display."""
+    target = touchscreen_output_name()
+    try:
+        monitors = json.loads(hypr_request("j/monitors", timeout=0.08) or "[]")
+        selected = next((m for m in monitors if m.get("name") == target), None)
+        if selected is None and monitors:
+            selected = next((m for m in monitors if m.get("focused")), monitors[0])
+        if selected:
+            scale = float(selected.get("scale") or 1.0)
+            return (
+                int(selected.get("x") or 0),
+                int(selected.get("y") or 0),
+                max(1, round(float(selected.get("width") or 1) / scale)),
+                max(1, round(float(selected.get("height") or 1) / scale)),
+                int(selected.get("transform") or 0),
+            )
+    except (ValueError, json.JSONDecodeError):
+        pass
+    return (0, 0, 1920, 1080, 0)
 
 
 def read_abs_range(fd: int, code: int) -> tuple[int, int]:
@@ -406,23 +559,10 @@ def read_abs_range(fd: int, code: int) -> tuple[int, int]:
     return minimum, maximum
 
 
-def find_device(name_fragment: str) -> str | None:
-    for dev in sorted(glob.glob("/dev/input/event*")):
-        event = os.path.basename(dev)
-        name_file = Path("/sys/class/input") / event / "device/name"
-        try:
-            name = name_file.read_text(errors="replace").strip().lower()
-        except OSError:
-            continue
-        if name_fragment in name:
-            return dev
-    return None
-
-
 class MTWatcher:
     def __init__(self, kind: str):
         self.kind = kind
-        self.name_fragment = TOUCHPAD_NAME if kind == "touchpad" else TOUCHSCREEN_NAME
+        self.name_override = TOUCHPAD_NAME_OVERRIDE if kind == "touchpad" else TOUCHSCREEN_NAME_OVERRIDE
         self.slot = 0
         self.slots: dict[int, dict[str, int | None]] = {}
         self.session = False
@@ -451,6 +591,7 @@ class MTWatcher:
         self.last_single_tap = -999.0
         self.drag_candidate = False
         self.dragging = False
+        self.keyboard_suppressed_until_lift = False
 
         # Direct touchscreen -> Aseprite bridge state.
         self.abs_x_min = 0
@@ -597,6 +738,7 @@ class MTWatcher:
         self.remote_fired = False
         self.drag_candidate = False
         self.dragging = False
+        self.keyboard_suppressed_until_lift = False
         self.pan_active = False
         self.pan_last_emit = 0.0
         self.pan_last_centroid = None
@@ -856,6 +998,28 @@ class MTWatcher:
         positioned = [s for s in active if s["x"] is not None and s["y"] is not None]
         now = time.monotonic()
 
+        if self.kind == "touchpad":
+            # This daemon consumes raw evdev contacts, bypassing libinput's
+            # disable-while-typing palm rejection. Once keyboard activity and
+            # a touch overlap, suppress the entire contact sequence until every
+            # finger lifts so it cannot become a late click/drag after timeout.
+            if active and keyboard_guard_active() and not self.keyboard_suppressed_until_lift:
+                self.keyboard_suppressed_until_lift = True
+                if self.dragging:
+                    mouse_left_up()
+                if self.pan_active:
+                    self.release_pan()
+                self.session = False
+                self.drag_candidate = False
+                self.dragging = False
+                log("touchpad suppressed while typing until lift")
+
+            if self.keyboard_suppressed_until_lift:
+                if not active:
+                    self.keyboard_suppressed_until_lift = False
+                    self.reset_session()
+                return
+
         if not active:
             if self.session:
                 self.finish(now)
@@ -1000,7 +1164,7 @@ class MTWatcher:
 
     def run_forever(self) -> None:
         while True:
-            device = find_device(self.name_fragment)
+            device = find_input_device(self.kind, self.name_override)
             if not device:
                 time.sleep(2)
                 continue
@@ -1029,10 +1193,33 @@ def control(action: str) -> int:
 
 
 def daemon() -> None:
+    # Quickshell can be restarted/reloaded while a Process child is still
+    # alive. Serialize daemon instances so duplicate raw-input readers can
+    # never synthesize the same click/drag multiple times.
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = CACHE_DIR / "daemon.lock"
+    lock_fd = open(lock_path, "a+")
+    log("waiting for single-instance lock")
+    fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+    lock_fd.seek(0)
+    lock_fd.truncate()
+    lock_fd.write(str(os.getpid()))
+    lock_fd.flush()
+
+    parent_pid = os.getppid()
+    log(f"single-instance lock acquired pid={os.getpid()} parent={parent_pid}")
+
+    keyboard_manager = threading.Thread(
+        target=keyboard_guard_manager,
+        daemon=True,
+        name="gesture-keyboard-manager",
+    )
+    keyboard_manager.start()
+
     ensure_touch_mouse()
     time.sleep(0.08)
     hypr_eval(
-        'hl.device({ name = "mirai-gesture-mouse", accel_profile = "flat", sensitivity = 0.0 })',
+        'hl.device({ name = "caelestia-gesture-mouse", accel_profile = "flat", sensitivity = 0.0 })',
         "gesture mouse flat profile",
     )
 
@@ -1040,14 +1227,14 @@ def daemon() -> None:
     touchscreen = MTWatcher("touchscreen")
     workers = [touchpad, touchscreen]
     threads = [
-        threading.Thread(target=w.run_forever, daemon=True, name=f"mirai-{w.kind}")
+        threading.Thread(target=w.run_forever, daemon=True, name=f"gesture-{w.kind}")
         for w in workers
     ]
     policy = threading.Thread(
         target=touch_policy_loop,
         args=(touchscreen,),
         daemon=True,
-        name="mirai-touch-policy",
+        name="gesture-touch-policy",
     )
 
     for t in threads:
@@ -1061,7 +1248,10 @@ def daemon() -> None:
                     raise RuntimeError(f"gesture worker {t.name} stopped")
             if not policy.is_alive():
                 raise RuntimeError("gesture policy worker stopped")
-            time.sleep(5)
+            if parent_pid > 1 and os.getppid() != parent_pid:
+                log(f"parent {parent_pid} exited; stopping orphaned gesture daemon")
+                return
+            time.sleep(0.5)
     finally:
         touchscreen.set_exclusive(False)
         set_touchpad_scroll_factor(configured_touchpad_scroll_factor())
