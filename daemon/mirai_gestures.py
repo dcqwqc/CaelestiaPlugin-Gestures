@@ -357,6 +357,20 @@ def toggle_fullscreen_if_still_active(address: str) -> None:
     if str(win.get("address") or "") != address:
         return
 
+    # Most dedicated media players already own double-click-to-fullscreen.
+    # Running our compositor toggle as well makes the native toggle and ours
+    # cancel each other, which looks like the gesture does nothing. Let those
+    # players handle the gesture natively; keep the global fallback for apps
+    # without their own double-click fullscreen behavior.
+    identity = f"{win.get('class', '')} {win.get('title', '')}".lower()
+    native_media_tokens = (
+        "org.gnome.showtime", "video player", "mpv", "celluloid",
+        "org.videolan.vlc", "vlc media player", "clapper",
+    )
+    if any(token in identity for token in native_media_tokens):
+        log(f"double-click fullscreen delegated to native media player address={address} identity={identity!r}")
+        return
+
     # SUPER+F on Mirai intentionally goes through yoga-tablet rather than the
     # raw Hyprland fullscreen dispatcher. That helper preserves the exact
     # fullscreenClient/internal state and the tablet keyboard fitted-fullscreen
