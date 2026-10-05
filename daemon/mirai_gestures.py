@@ -514,7 +514,12 @@ def pointer_button_devices() -> list[str]:
             ).stdout
         except (OSError, subprocess.TimeoutExpired):
             continue
-        if "ID_INPUT_MOUSE=1" in (info or "").splitlines():
+        properties = set((info or "").splitlines())
+        # Laptop clickpads are commonly exposed through an *-event-mouse
+        # symlink while udev classifies the real event node as a touchpad, not
+        # a mouse. Accept both so physical clickpad presses reach the global
+        # double-click detector.
+        if "ID_INPUT_MOUSE=1" in properties or "ID_INPUT_TOUCHPAD=1" in properties:
             found.add(dev)
     return sorted(found)
 
