@@ -54,6 +54,8 @@ DRAG_START_MOVE = 70.0
 KEYBOARD_QUIET_SECONDS = 0.60  # palm/touchpad guard after any physical key press
 REMOTE_SWIPE_DISTANCE = 500.0
 REMOTE_COOLDOWN = 0.85
+TOUCH_OSK_SWIPE_FRACTION = 0.12  # fraction of touch sensor width
+TOUCH_OSK_HORIZONTAL_BIAS = 1.4
 TWO_PAN_START = 0.008        # normalized centroid travel (~0.8% of pad/screen)
 TWO_ZOOM_START_LOG = 0.040    # touchpad: ~4% scale change before zoom locks in
 TWO_ZOOM_DOMINANCE = 1.30    # touchpad scale change vs centroid translation
@@ -1408,6 +1410,22 @@ class MTWatcher:
             if self.kind == "touchpad" and self.drag_candidate and self.max_fingers == 1 and not self.dragging and move >= DRAG_START_MOVE:
                 mouse_left_down()
                 self.dragging = True
+
+            # Four-finger horizontal *screen* swipe explicitly controls the
+            # existing Yoga on-screen keyboard. Touchpad swipe4 remains the
+            # separate Remote Desktop shortcut below.
+            if (self.kind == "touchscreen" and len(active) == 4
+                    and not self.remote_fired and c is not None
+                    and self.start_centroid is not None):
+                dx = c[0] - self.start_centroid[0]
+                dy = c[1] - self.start_centroid[1]
+                width = max(1, self.abs_x_max - self.abs_x_min)
+                if (abs(dx) >= width * TOUCH_OSK_SWIPE_FRACTION
+                        and abs(dx) >= TOUCH_OSK_HORIZONTAL_BIAS * abs(dy)):
+                    self.remote_fired = True  # once per complete contact sequence
+                    action = "show" if dx > 0 else "hide"
+                    quiet_popen([YOGA_TABLET, "osk", action])
+                    log(f"touchscreen swipe4 {action} -> yoga-tablet osk")
 
             if self.kind == "touchpad" and len(active) == 4 and not self.remote_fired:
                 if move >= REMOTE_SWIPE_DISTANCE and now - self.last_remote >= REMOTE_COOLDOWN:
