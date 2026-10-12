@@ -38,5 +38,4 @@ StyledRect {
         fontStyle: Tokens.font.icon.medium
     }
 
-    onVisibleChanged: if (visible) Gest.Gestures.refresh()
 }
