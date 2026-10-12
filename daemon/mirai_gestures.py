@@ -52,10 +52,9 @@ TOUCH_TAP_MAX_MOVE = 1000.0  # about 48 px on Mirai; tolerant of fingertip jitte
 DRAG_ARM_SECONDS = 0.38
 DRAG_START_MOVE = 70.0
 KEYBOARD_QUIET_SECONDS = 0.60  # palm/touchpad guard after any physical key press
-REMOTE_SWIPE_DISTANCE = 500.0
-REMOTE_COOLDOWN = 0.85
-TOUCH_OSK_SWIPE_FRACTION = 0.12  # fraction of touch sensor width
-TOUCH_OSK_HORIZONTAL_BIAS = 1.4
+TOUCH_OSK_SWIPE_FRACTION = 0.10  # deliberate motion across touch sensor width
+TOUCH_OSK_DIRECTION_START = 0.025  # classify early, execute later
+TOUCH_OSK_HORIZONTAL_BIAS = 1.5
 TWO_PAN_START = 0.008        # normalized centroid travel (~0.8% of pad/screen)
 TWO_ZOOM_START_LOG = 0.040    # touchpad: ~4% scale change before zoom locks in
 TWO_ZOOM_DOMINANCE = 1.30    # touchpad scale change vs centroid translation
@@ -875,8 +874,8 @@ class MTWatcher:
         self.two_pan_committed = False
         self.two_started_at = 0.0
         self.two_settled = False
-        self.remote_fired = False
-        self.last_remote = 0.0
+        self.four_swipe_fired = False
+        self.four_swipe_axis: str | None = None
         self.last_single_tap = -999.0
         self.drag_candidate = False
         self.dragging = False
@@ -1024,7 +1023,8 @@ class MTWatcher:
         self.two_pan_committed = False
         self.two_started_at = 0.0
         self.two_settled = False
-        self.remote_fired = False
+        self.four_swipe_fired = False
+        self.four_swipe_axis = None
         self.drag_candidate = False
         self.dragging = False
         self.keyboard_suppressed_until_lift = False
@@ -1261,16 +1261,22 @@ class MTWatcher:
             self.reset_session()
             return
 
+        fingers = self.max_fingers
         tap_move_limit = TOUCH_TAP_MAX_MOVE if self.kind == "touchscreen" else TAP_MAX_MOVE
+        # A short diagonal/vertical four-finger swipe must never cause Redo
+        # merely because it ends before the general multi-tap time limit.
+        four_tap_range = 0.035 * max(1, self.abs_x_max - self.abs_x_min,
+                                     self.abs_y_max - self.abs_y_min)
         is_tap = (
             duration <= TAP_MAX_SECONDS
             and self.max_move <= tap_move_limit
             and not self.pinch_active
-            and not self.remote_fired
+            and not self.four_swipe_fired
+            and (fingers != 4 or (self.four_swipe_axis is None
+                                  and self.max_move <= four_tap_range))
         )
-        fingers = self.max_fingers
         if fingers >= 3 and not is_tap:
-            log(f"{self.kind} {fingers}-finger end rejected: duration={duration:.3f}s move={self.max_move:.1f} pinch={self.pinch_active} remote={self.remote_fired}")
+            log(f"{self.kind} {fingers}-finger end rejected: duration={duration:.3f}s move={self.max_move:.1f} pinch={self.pinch_active} remote={self.four_swipe_fired}")
         if is_tap:
             if self.kind == "touchpad" and fingers == 1:
                 mouse_click("left")
@@ -1411,29 +1417,31 @@ class MTWatcher:
                 mouse_left_down()
                 self.dragging = True
 
-            # One four-contact sequence fires exactly once. Horizontal swipes
-            # control the OSK on either touch surface; vertical touchpad swipes
-            # keep the existing Remote Desktop shortcut available.
-            if (len(active) == 4 and not self.remote_fired and c is not None
+            # Both raw evdev readers and Hyprtasking see the same swipe.
+            # Lock the axis early, but only execute the horizontal OSK command
+            # after meaningful displacement. Vertical swipes are exclusively
+            # owned by Hyprtasking's workspace grid; never toggle Remote here.
+            if (len(active) == 4 and not self.four_swipe_fired and c is not None
                     and self.start_centroid is not None):
                 dx = c[0] - self.start_centroid[0]
                 dy = c[1] - self.start_centroid[1]
-                width = max(1, self.abs_x_max - self.abs_x_min)
-                height = max(1, self.abs_y_max - self.abs_y_min)
-                nx, ny = dx / width, dy / height
-                if (abs(nx) >= TOUCH_OSK_SWIPE_FRACTION
-                        and abs(nx) >= TOUCH_OSK_HORIZONTAL_BIAS * abs(ny)):
-                    self.remote_fired = True
+                nx = dx / max(1, self.abs_x_max - self.abs_x_min)
+                ny = dy / max(1, self.abs_y_max - self.abs_y_min)
+                if self.four_swipe_axis is None:
+                    if (abs(nx) >= TOUCH_OSK_DIRECTION_START
+                            and abs(nx) >= TOUCH_OSK_HORIZONTAL_BIAS * abs(ny)):
+                        self.four_swipe_axis = "horizontal"
+                    elif (abs(ny) >= TOUCH_OSK_DIRECTION_START
+                          and abs(ny) >= TOUCH_OSK_HORIZONTAL_BIAS * abs(nx)):
+                        self.four_swipe_axis = "vertical"
+                    if self.four_swipe_axis is not None:
+                        log(f"{self.kind} swipe4 axis={self.four_swipe_axis}")
+                if (self.four_swipe_axis == "horizontal"
+                        and abs(nx) >= TOUCH_OSK_SWIPE_FRACTION):
+                    self.four_swipe_fired = True
                     action = "show" if nx > 0 else "hide"
                     quiet_popen([YOGA_TABLET, "osk", action])
                     log(f"{self.kind} swipe4 {action} -> yoga-tablet osk")
-                elif (self.kind == "touchpad" and abs(ny) >= 0.12
-                      and abs(ny) >= TOUCH_OSK_HORIZONTAL_BIAS * abs(nx)
-                      and now - self.last_remote >= REMOTE_COOLDOWN):
-                    self.remote_fired = True
-                    self.last_remote = now
-                    toggle_remote()
-                    log("touchpad vertical swipe4 -> remote toggle")
 
         # Pinch zoom is supported on both the touchpad and direct touchscreen.
         # It is Aseprite-only, so normal browser/image pinch behavior elsewhere
