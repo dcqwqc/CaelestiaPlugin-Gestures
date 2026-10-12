@@ -570,6 +570,36 @@ def wheel(ticks: int) -> None:
     log(f"wheel ticks={ticks}")
 
 
+def hotkeys_tap(kind: str, fingers: int) -> bool:
+    """Try the shared Hotkeys registry, preserving all existing fallbacks.
+
+    Only complete 3/4-finger taps are bridged. Never capture or alter native
+    two-finger scrolling, tap-drag, touchscreen paint or Remote Desktop swipes.
+    No keyboard event is produced unless a custom mapping really handled it.
+    """
+    if kind not in ("touchpad", "touchscreen") or fingers not in (3, 4):
+        return False
+    path = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "celestios-control.sock"
+    if not path.exists():
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(0.12)
+            conn.connect(str(path))
+            payload = {"source": kind, "device": "local", "trigger": f"tap{fingers}", "event": "tap"}
+            conn.sendall((json.dumps(payload) + chr(10)).encode())
+            raw = b""
+            while not raw.endswith(bytes([10])) and len(raw) < 4096:
+                block = conn.recv(4096 - len(raw))
+                if not block:
+                    break
+                raw += block
+            answer = json.loads(raw)
+            return answer.get("ok") is True and answer.get("handled") is True
+    except (OSError, ValueError, TimeoutError):
+        return False
+
+
 def hypr_shortcut(key: str) -> None:
     # External dispatcher path is reliable on Hyprland 0.56 for both native
     # Wayland and XWayland clients.
@@ -1255,12 +1285,18 @@ class MTWatcher:
                 log(f"touchscreen tap1 -> double-tap candidate x={tx} y={ty}")
                 self.last_single_tap = -999.0
             elif fingers == 3:
-                hypr_shortcut("z")
-                log(f"{self.kind} tap3 -> undo")
+                if hotkeys_tap(self.kind, 3):
+                    log(f"{self.kind} tap3 -> Hotkeys mapping")
+                else:
+                    hypr_shortcut("z")
+                    log(f"{self.kind} tap3 -> undo (default)")
                 self.last_single_tap = -999.0
             elif fingers == 4:
-                hypr_shortcut("y")
-                log(f"{self.kind} tap4 -> redo")
+                if hotkeys_tap(self.kind, 4):
+                    log(f"{self.kind} tap4 -> Hotkeys mapping")
+                else:
+                    hypr_shortcut("y")
+                    log(f"{self.kind} tap4 -> redo (default)")
                 self.last_single_tap = -999.0
         self.reset_session()
 

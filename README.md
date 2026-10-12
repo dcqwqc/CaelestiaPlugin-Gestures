@@ -19,3 +19,15 @@ Legacy filenames such as mirai_gestures.py and mirai-gestures.service are retain
 ## Double-click fullscreen
 
 The plugin settings include **Double-click to fullscreen**. When enabled, two primary clicks on the same window within 380 ms and 32 px toggle Hyprland fullscreen. The same gesture exits fullscreen. Physical mouse/clickpad buttons and the plugin's synthetic one-finger touchpad taps are supported; disabling the setting stops the detector without disabling the rest of the gesture daemon.
+
+## Shared Hotkeys integration
+
+The low-level daemon now optionally publishes completed three- and four-finger
+touchpad and touchscreen taps to the local Hotkeys UNIX socket. A user mapping
+with input source touchpad/touchscreen and token tap3/tap4 takes precedence;
+otherwise the original Ctrl+Z Undo / Ctrl+Y Redo behavior is preserved. The
+live 15-second capture window can record a tap without executing Undo/Redo.
+
+No physical device grabs or read policies were added, and one/two-finger taps,
+native scrolling, remote-desktop swipes and Aseprite pan/zoom remain unchanged.
+See Hotkeys provider specification in dcqwqc/CaelestiaPlugin-Hotkeys.
