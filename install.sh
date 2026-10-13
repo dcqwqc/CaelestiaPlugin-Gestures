@@ -6,6 +6,7 @@ mkdir -p "$HOME/.local/bin" "$HOME/.local/libexec" "$HOME/.config/systemd/user" 
 install -m 0755 "$root/daemon/mirai_gestures.py" "$HOME/.local/bin/mirai-gestures"
 install -m 0644 "$root/systemd/mirai-gestures.service" "$HOME/.config/systemd/user/mirai-gestures.service"
 ln -sfn "$root" "$HOME/.local/share/caelestia/plugins/gestures"
+python3 "$root/scripts/integrate-touchscreen-osk.py"
 systemctl --user disable --now kagami-touchpad-remote-gesture.service 2>/dev/null || true
 systemctl --user daemon-reload
 systemctl --user enable --now mirai-gestures.service

@@ -31,3 +31,14 @@ live 15-second capture window can record a tap without executing Undo/Redo.
 No physical device grabs or read policies were added, and one/two-finger taps,
 native scrolling, remote-desktop swipes and Aseprite pan/zoom remain unchanged.
 See Hotkeys provider specification in dcqwqc/CaelestiaPlugin-Hotkeys.
+
+
+## Four-finger touch keyboard toggle
+
+A four-finger swipe in any direction toggles the existing Yoga OSK. On the
+touchpad, raw evdev handling continues to work independently. On the direct
+touchscreen, **Hyprgrass** recognizes swipes in each of the four directions;
+the low-level watcher does not also toggle the OSK, preventing double actions.
+Run `scripts/integrate-touchscreen-osk.py` or `install.sh` to persist the
+four Hyprgrass bindings in `~/.config/caelestia/hypr-user.lua`.
+Hyprtasking's four-finger trigger remains disabled (Super+Tab opens the grid).

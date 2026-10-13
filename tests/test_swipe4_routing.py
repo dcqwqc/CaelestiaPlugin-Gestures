@@ -27,12 +27,12 @@ class FourFingerRoutingTests(unittest.TestCase):
             slot["y"] = 400 + y
         watcher.report()
 
-    def test_eight_directions_on_touchpad_and_direct_screen(self):
+    def test_eight_directions_on_touchpad(self):
         directions = [
             (150, 0), (-150, 0), (0, 150), (0, -150),
             (120, 120), (-120, 120), (120, -120), (-120, -120),
         ]
-        for kind in ("touchpad", "touchscreen"):
+        for kind in ("touchpad",):
             for dx, dy in directions:
                 with self.subTest(kind=kind, direction=(dx, dy)):
                     watcher = self.make_watcher(kind)
@@ -46,8 +46,9 @@ class FourFingerRoutingTests(unittest.TestCase):
                         run.assert_called_once_with([M.YOGA_TABLET, "osk", "toggle"])
 
     def test_can_toggle_again_after_all_fingers_lift(self):
-        watcher = self.make_watcher("touchscreen")
+        watcher = self.make_watcher("touchpad")
         with (patch.object(M, "quiet_popen") as run,
+              patch.object(M, "keyboard_guard_active", return_value=False),
               patch.object(M, "aseprite_active", return_value=False),
               patch.object(M, "touchscreen_logical_geometry", return_value=(0, 0, 1440, 900, 0))):
             self.move(watcher)
@@ -63,6 +64,20 @@ class FourFingerRoutingTests(unittest.TestCase):
             self.assertEqual(run.call_count, 2)
             for call in run.call_args_list:
                 self.assertEqual(call.args[0], [M.YOGA_TABLET, "osk", "toggle"])
+
+    def test_direct_screen_raw_events_never_double_toggle(self):
+        # Hyprgrass owns the direct-touch swipe. The evdev watcher still
+        # observes contacts for taps/other features, but does not toggle OSK.
+        for dx, dy in ((180, 0), (-180, 0), (0, 180), (0, -180),
+                       (180, 180), (-180, -180)):
+            with self.subTest(direction=(dx, dy)):
+                watcher = self.make_watcher("touchscreen")
+                with (patch.object(M, "quiet_popen") as run,
+                      patch.object(M, "aseprite_active", return_value=False),
+                      patch.object(M, "touchscreen_logical_geometry", return_value=(0, 0, 1440, 900, 0))):
+                    self.move(watcher)
+                    self.move(watcher, x=dx, y=dy)
+                    run.assert_not_called()
 
     def test_small_movement_does_not_trigger(self):
         for kind in ("touchpad", "touchscreen"):

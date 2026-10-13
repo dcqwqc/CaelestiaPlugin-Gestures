@@ -1412,12 +1412,11 @@ class MTWatcher:
                 mouse_left_down()
                 self.dragging = True
 
-            # A complete four-finger swipe toggles the Yoga touch keyboard,
-            # regardless of direction or input surface. Use normalized x/y
-            # distances so vertical, diagonal and rotated-screen swipes work.
-            # Only trigger once until every finger lifts; retain four-finger
-            # taps (Redo / Hotkeys) as a separate, shorter gesture.
-            if (len(active) == 4 and not self.four_swipe_fired
+            # The working touchpad uses evdev for this action. Direct screen
+            # gestures instead use Hyprgrass, which owns touchscreen swipes
+            # in Hyprland. Never fire both paths or one swipe toggles twice.
+            # Four-finger taps (Redo / Hotkeys) remain handled here.
+            if (self.kind == "touchpad" and len(active) == 4 and not self.four_swipe_fired
                     and c is not None and self.start_centroid is not None):
                 dx = (c[0] - self.start_centroid[0]) / max(1, self.abs_x_max - self.abs_x_min)
                 dy = (c[1] - self.start_centroid[1]) / max(1, self.abs_y_max - self.abs_y_min)
