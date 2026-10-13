@@ -5,7 +5,7 @@ This project owns Mirai's low-level multi-touch gesture policy.
 Non-negotiable invariants:
 - Never EVIOCGRAB the touchpad or touchscreen.
 - Preserve native two-finger scrolling, pointer motion, touchscreen input, and Wacom pen input.
-- Four-finger horizontal touchpad/touchscreen swipes control the touch keyboard; four-finger vertical touchpad swipes belong to Hyprtasking workspace grid. Remote Desktop remains available from its own UI, not this conflicting four-finger swipe.
+- Four-finger swipe in any direction on the touchpad OR direct touchscreen toggles the existing Yoga on-screen keyboard. Hyprtasking workspace grid must not consume four-finger swipes; access the grid via Super+Tab and use three fingers to navigate while open. Remote Desktop stays accessible via its own UI.
 - Aseprite pinch-to-wheel translation must be scoped to an active Aseprite window only.
 - Mirai disables native touchpad tap-to-click so a 3-finger tap cannot also emit MMB. Therefore this daemon must preserve 1-finger left click, 2-finger right click, and tap-drag behavior.
 - Do not duplicate the four-finger remote gesture in another daemon.
