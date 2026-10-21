@@ -1,0 +1,23 @@
+{
+  "name": "Gestures",
+  "version": "1.1.0",
+  "author": "dcqwqc",
+  "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-Gestures",
+  "icon": "gesture",
+  "description": "Hardware-discovered touchpad and touchscreen gestures with app-aware pinch/pan, Undo/Redo, remote-desktop swipes, and optional double-click fullscreen.",
+  "entryPoints": [
+    {
+      "type": "custom",
+      "source": "Main.qml"
+    },
+    {
+      "type": "quick-toggle",
+      "source": "toggles/GesturesToggle.qml",
+      "properties": {
+        "name": "gestures"
+      }
+    }
+  ],
+  "settings": "Settings.qml",
+  "requires": ">=2.1.0"
+}
