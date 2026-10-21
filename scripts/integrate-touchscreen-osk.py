@@ -39,9 +39,9 @@ hl.plugin.hyprgrass.bind({
     action = hl.dsp.window.drag(),
     mouse = true,
 })
-hl.plugin.hyprgrass.gesture({
+hl.plugin.hyprgrass.bind({
     pattern = {kind = "swipe", fingers = 3, direction = "down"},
-    action = "close",
+    action = hl.dsp.window.close(),
 })
 -- Caelestia Gestures: end direct-touch system gestures
 '''.strip()

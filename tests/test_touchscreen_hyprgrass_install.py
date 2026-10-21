@@ -30,7 +30,7 @@ class TouchscreenHyprgrassInstallTest(unittest.TestCase):
             self.assertIn('kind = "longpress", fingers = 3', data)
             self.assertIn('action = hl.dsp.window.drag()', data)
             self.assertIn('kind = "swipe", fingers = 3, direction = "down"', data)
-            self.assertIn('action = "close"', data)
+            self.assertIn('action = hl.dsp.window.close()', data)
             self.assertEqual(len(list(config.parent.glob("hypr-user.lua.bak-system-gestures-*"))), 1)
 
     def test_touchscreen_raw_watcher_never_double_toggles(self):
