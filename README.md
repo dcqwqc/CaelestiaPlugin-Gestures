@@ -42,3 +42,23 @@ the low-level watcher does not also toggle the OSK, preventing double actions.
 Run `scripts/integrate-touchscreen-osk.py` or `install.sh` to persist the
 four Hyprgrass bindings in `~/.config/caelestia/hypr-user.lua`.
 Hyprtasking's four-finger trigger remains disabled (Super+Tab opens the grid).
+
+
+## Three-finger window control (Hyprland 0.56)
+
+The active Mirai Hyprland Lua config uses Hyprgrass for direct touchscreen
+three-finger long-press + drag to move a window, and a short three-finger
+downward swipe to close the touched window. The touchpad uses native Hyprland
+three-finger directional gestures: down closes; up/left/right move a window.
+
+The integration script registers these together with the four-direction direct
+screen OSK gestures and loads the matching pinned Hyprgrass binary. It is
+idempotent and creates a backup before editing the Hyprland config. The script
+must be rerun after restoring an older hypr-user.lua. Hyprgrass must be rebuilt
+for the new ABI after a Hyprland upgrade.
+
+When Caelestia QuickShell manages the plugin, **do not enable** the legacy
+mirai-gestures.service as a second process. The installer enforces this.
+The Zen touchscreen swipe bridge independently captures the touchscreen while
+Zen is focused; its classifier must defer early two-finger decisions to give
+three/four-finger system gestures priority.

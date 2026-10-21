@@ -9,4 +9,11 @@ ln -sfn "$root" "$HOME/.local/share/caelestia/plugins/gestures"
 python3 "$root/scripts/integrate-touchscreen-osk.py"
 systemctl --user disable --now kagami-touchpad-remote-gesture.service 2>/dev/null || true
 systemctl --user daemon-reload
-systemctl --user enable --now mirai-gestures.service
+# Caelestia QuickShell owns this daemon when its plugin is installed. Starting
+# the legacy systemd unit as well duplicates raw input readers/actions.
+if systemctl --user is-active --quiet caelestia-shell.service; then
+  systemctl --user disable --now mirai-gestures.service 2>/dev/null || true
+  echo "Caelestia owns the gesture daemon; standalone systemd unit disabled"
+else
+  systemctl --user enable --now mirai-gestures.service
+fi
